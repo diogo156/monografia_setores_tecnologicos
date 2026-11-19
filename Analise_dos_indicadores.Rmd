@@ -1,0 +1,1185 @@
+---
+title: "Indicadores de insumo-produto dos setores intensivos em tecnologia (2018)"
+subtitle: "Parte 2 – índices de ligação, índices puros, campo de influência e redes"
+author: "Diogo Araujo Nogueira"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Apresentação
+
+Este documento é a segunda parte dos códigos da monografia. Ele calcula e apresenta
+os indicadores de insumo-produto dos setores intensivos em tecnologia (índice de
+esforço tecnológico > 1) e dos não intensivos, a partir da MIP 2018 do NEREUS/USP.
+
+**Antes de rodar:** execute o R Markdown da Parte 1 (Scripts 01 a 04 – leitura e
+conferência das bases e estimação da P&D). Este documento usa, do Environment:
+`mZ`, `mA`, `mLeontief`, `vX`, `nSetores`, `lCodigoSetores`, `dReferencia` e `dEsforco_C2`.
+
+**Ordem:** os chunks devem ser rodados de cima para baixo.
+
+| Seção | Conteúdo | Antigo script |
+|---|---|---|
+| 1 | Parâmetros e chaves de exportação | – |
+| 2 | Bibliotecas | – |
+| 3 | Funções (todas, uma única vez) | 05, 06 e 07 |
+| 4 | Cálculo dos indicadores (HR, GHS, campo de influência) | 05 |
+| 5 | Tabelas dos setores intensivos e não intensivos | 06 e 07 |
+| 6 | Gráficos: redes de coeficientes técnicos e mapa de calor | 06 |
+| 7 | Exportação (Excel, HTML, LaTeX e Word) | 05, 06 e 07 |
+
+# 1. Parâmetros e chaves de exportação
+
+Todas as escolhas do usuário ficam aqui.
+
+```{r parametros}
+# Exportação
+bExportarResultados = TRUE   # FALSE: só visualiza no RStudio, sem salvar em ./Outputs
+bExportar68Setores  = FALSE  # TRUE: inclui no Excel uma aba com os indicadores dos 68 setores
+bExportarWord       = TRUE   # TRUE: gera tabelas e figuras em Word (.docx); exige flextable/officer
+
+# Redes de coeficientes técnicos
+nLimiteCoef  = 0.02          # ligação quando a_ij (ou a_ji) >= este valor
+nLimiteForte = 0.05          # ligação forte (linha cinza-escura)
+sTamanhoBolinha = "IE"       # tamanho dos círculos: "IE" (esforço tecnológico), "PeD" ou "PTLN"
+```
+
+# 2. Bibliotecas
+
+```{r bibliotecas}
+if (!require("openxlsx")) install.packages("openxlsx")
+if (!require("matrixStats")) install.packages("matrixStats")
+if (!require("kableExtra")) install.packages("kableExtra")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("ggrepel")) install.packages("ggrepel")
+if (!require("igraph")) install.packages("igraph")
+if (!require("dplyr")) install.packages("dplyr")
+
+library(openxlsx)
+library(matrixStats)
+library(kableExtra)
+library(ggplot2)
+library(ggrepel)
+library(igraph)
+library(dplyr)
+
+# flextable e officer só são usados para gerar as tabelas em Word (.docx). Se não
+# carregarem (ex.: versão antiga do R ou do systemfonts), o script roda normalmente
+# e apenas pula a geração do .docx.
+bWordDisponivel <- suppressWarnings(suppressMessages(
+  tryCatch(require("flextable") && require("officer"), error = function(e) FALSE)))
+if (!bWordDisponivel) message("Aviso: flextable/officer indisponíveis - as tabelas em .docx não serão geradas.")
+# para as figuras em Word basta o officer
+bOfficerDisponivel <- suppressWarnings(suppressMessages(
+  tryCatch(require("officer"), error = function(e) FALSE)))
+```
+
+# 3. Funções
+
+Todas as funções do documento, definidas uma única vez.
+
+```{r funcoes}
+# --- Gerais ---
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Objetos ausentes no Environment:", paste(lFaltando, collapse = ", ")))
+  }
+}
+
+# Classificação de Hirschman-Rasmussen a partir dos índices para trás e para frente
+fClassificacaoHR <- function(vTras, vFrente) {
+  ifelse(vTras > 1 & vFrente > 1, "Setor-chave",
+         ifelse(vTras > 1, "Forte encadeamento para trás",
+                ifelse(vFrente > 1, "Forte encadeamento para frente",
+                       "Fraco encadeamento")))
+}
+
+# --- Excel (indicadores) ---
+# Escreve uma tabela em uma aba do Excel com a estética das tabelas de P&D
+# (Times New Roman 9, cabeçalho com bordas, linha final, notas abaixo).
+#   vCabecalho : nomes das colunas exibidos
+#   vFormatos  : formato numérico de cada coluna ("@" para texto)
+#   vDestaque  : colunas numéricas cujo valor > 1 recebe negrito
+fEscreverTabela <- function(wb, sAba, sTitulo, dTabela, vCabecalho, vFormatos, vNotas,
+                            vLarguras, vDestaque = integer(0)) {
+  addWorksheet(wb, sAba, gridLines = FALSE)
+  sFonte <- "Times New Roman"
+  nCol <- ncol(dTabela)
+  writeData(wb, sAba, sTitulo, startRow = 1, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 11, textDecoration = "bold"),
+           rows = 1, cols = 1)
+  writeData(wb, sAba, t(vCabecalho), startRow = 3, startCol = 1, colNames = FALSE)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, halign = "center",
+                                 valign = "center", wrapText = TRUE,
+                                 border = "TopBottomLeftRight", borderStyle = "thin"),
+           rows = 3, cols = 1:nCol, gridExpand = TRUE)
+  setRowHeights(wb, sAba, rows = 3, heights = 48)
+
+  nInicio <- 4
+  writeData(wb, sAba, dTabela, startRow = nInicio, startCol = 1, colNames = FALSE, keepNA = FALSE)
+  for (j in seq_len(nCol)) {
+    vLinhas <- nInicio + seq_len(nrow(dTabela)) - 1
+    addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = vFormatos[j],
+                                   halign = if (vFormatos[j] == "@") "left" else "right"),
+             rows = vLinhas, cols = j)
+    if (j %in% vDestaque) {
+      vMaior1 <- which(!is.na(dTabela[[j]]) & dTabela[[j]] > 1)
+      if (length(vMaior1) > 0) {
+        addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = vFormatos[j],
+                                       halign = "right", textDecoration = "bold"),
+                 rows = nInicio + vMaior1 - 1, cols = j)
+      }
+    }
+  }
+  nFim <- nInicio + nrow(dTabela) - 1
+  addStyle(wb, sAba, createStyle(border = "bottom", borderStyle = "thin"),
+           rows = nFim, cols = 1:nCol, gridExpand = TRUE, stack = TRUE)
+  writeData(wb, sAba, vNotas, startRow = nFim + 2, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8),
+           rows = (nFim + 2):(nFim + 1 + length(vNotas)), cols = 1)
+  setColWidths(wb, sAba, cols = 1:nCol, widths = vLarguras)
+  freezePane(wb, sAba, firstActiveRow = nInicio, firstActiveCol = 2)
+}
+
+# --- Tabelas: kableExtra (HTML), LaTeX e Word ---
+
+# Monta uma tabela no modelo kableExtra (listrada, compacta, título acima, fonte abaixo)
+fTabelaKable <- function(dTabela, sTitulo, sFonte) {
+  kbl(dTabela, digits = 2, row.names = FALSE, caption = sTitulo,
+      align = c("c", "l", rep("c", ncol(dTabela) - 2)),
+      format.args = list(decimal.mark = ",")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE) %>%
+    column_spec(1, width = "5%") %>%
+    column_spec(2, width = "40%") %>%
+    kableExtra::footnote(general = sFonte, general_title = "Fonte: ", footnote_as_chunk = TRUE)
+}
+
+# Salva a tabela em HTML (autocontido quando o pandoc está disponível, como no RStudio)
+fSalvarKable <- function(kTabela, sArquivo) {
+  tryCatch(save_kable(kTabela, sArquivo, self_contained = TRUE),
+           error = function(e) save_kable(kTabela, sArquivo, self_contained = FALSE))
+}
+
+# Gera o código LaTeX de uma tabela no estilo booktabs (fio abaixo do cabeçalho e
+# no final, sem linhas verticais, espaçamento largo, vírgula decimal e ponto de
+# milhar). Usa xltabular (longtable com largura igual à do texto): tabelas longas
+# quebram de página repetindo o cabeçalho, e a coluna "L" ocupa o espaço restante.
+#   vCabecalho : títulos das colunas (quebram linha sozinhos dentro da largura da coluna)
+#   vAlinh     : tipo de cada coluna: "c" (centralizada estreita, ex.: Nº), "L" (texto que
+#                ocupa o espaço restante, ex.: Setores), "N" (número, largura nLarguraNum)
+#                ou "T" (texto curto, largura nLarguraTexto, ex.: Classificação)
+# Pacotes necessários no preâmbulo do Overleaf:
+#   \usepackage{booktabs, xltabular, array}
+fTabelaLatex <- function(dTabela, vCabecalho, vAlinh, sTitulo, sFonte, sRotulo, sArquivo,
+                         nEspacamento = 1.6, sTamanhoFonte = "\\small",
+                         nLarguraNum = "2.5cm", nLarguraTexto = "2.8cm") {
+  fEscapar <- function(x) gsub("([&%$#_])", "\\\\\\1", x)
+  fTexto <- function(x) gsub(">=", "$\\\\geq$", gsub("<=", "$\\\\leq$", fEscapar(x)))
+  fFormatar <- function(v) {
+    if (!is.numeric(v)) return(fEscapar(as.character(v)))
+    if (all(v == round(v), na.rm = TRUE)) {
+      return(formatC(v, format = "d", big.mark = ".", decimal.mark = ","))
+    }
+    formatC(v, format = "f", digits = 2, big.mark = ".", decimal.mark = ",")
+  }
+  nCol <- ncol(dTabela)
+  mCelulas <- sapply(dTabela, fFormatar)
+  vLinhas <- apply(mCelulas, 1, function(x) paste0(paste(x, collapse = " & "), " \\\\"))
+  vCab <- fEscapar(gsub("\\\\\\\\", " ", vCabecalho))   # remove quebras manuais
+  sCabecalho <- paste0(paste(vCab, collapse = " & "), " \\\\")
+  vTex <- c(
+    "% Tabela gerada no R - pacotes: \\usepackage{booktabs, xltabular, array}",
+    "{",
+    "\\renewcommand{\\tabularxcolumn}[1]{m{#1}}",
+    "\\newcolumntype{L}{>{\\raggedright\\arraybackslash}X}",
+    paste0("\\newcolumntype{N}{>{\\centering\\arraybackslash}m{", nLarguraNum, "}}"),
+    paste0("\\newcolumntype{T}{>{\\raggedright\\arraybackslash}m{", nLarguraTexto, "}}"),
+    "\\setlength{\\LTcapwidth}{\\linewidth}",
+    sTamanhoFonte,
+    paste0("\\renewcommand{\\arraystretch}{", nEspacamento, "}"),
+    paste0("\\begin{xltabular}{\\linewidth}{", paste(vAlinh, collapse = " "), "}"),
+    paste0("\\caption{", fTexto(sTitulo), "}\\label{", sRotulo, "} \\\\"),
+    "\\toprule", sCabecalho, "\\midrule", "\\endfirsthead",
+    paste0("\\multicolumn{", nCol, "}{l}{\\footnotesize\\textit{(continuação)}} \\\\"),
+    "\\toprule", sCabecalho, "\\midrule", "\\endhead",
+    "\\midrule",
+    paste0("\\multicolumn{", nCol, "}{r}{\\footnotesize\\textit{(continua)}} \\\\"),
+    "\\endfoot",
+    "\\bottomrule",
+    paste0("\\multicolumn{", nCol, "}{>{\\raggedright\\arraybackslash}p{\\dimexpr\\linewidth-2\\tabcolsep}}{\\footnotesize Fonte: ",
+           fTexto(sFonte), "} \\\\"),
+    "\\endlastfoot",
+    vLinhas,
+    "\\end{xltabular}",
+    "}")
+  con <- file(sArquivo, open = "w", encoding = "UTF-8")
+  writeLines(vTex, con)
+  close(con)
+  invisible(vTex)
+}
+
+# Monta uma tabela para o Word no mesmo estilo das tabelas em LaTeX: Times New Roman 10,
+# fio no topo, abaixo do cabeçalho e no final, sem linhas verticais, vírgula decimal.
+#   vLarguras : largura de cada coluna em cm (a soma deve caber na largura do texto, 16 cm)
+fTabelaWord <- function(dTabela, vLarguras, sFonteLetra = "Times New Roman", nTamanho = 10) {
+  bNumerica <- sapply(dTabela, is.numeric)
+  bInteira <- sapply(dTabela, function(v) is.numeric(v) && all(v == round(v), na.rm = TRUE))
+  ftTabela <- flextable(dTabela) %>%
+    colformat_double(j = which(bNumerica & !bInteira), digits = 2, big.mark = ".", decimal.mark = ",") %>%
+    colformat_double(j = which(bInteira), digits = 0, big.mark = ".", decimal.mark = ",") %>%
+    font(fontname = sFonteLetra, part = "all") %>%
+    fontsize(size = nTamanho, part = "all") %>%
+    border_remove() %>%
+    hline_top(part = "header", border = fp_border(color = "black", width = 1)) %>%
+    hline_bottom(part = "header", border = fp_border(color = "black", width = 0.75)) %>%
+    hline_bottom(part = "body", border = fp_border(color = "black", width = 1)) %>%
+    align(j = which(bNumerica), align = "center", part = "all") %>%
+    align(j = which(!bNumerica), align = "left", part = "all") %>%
+    valign(valign = "center", part = "all") %>%
+    padding(padding.top = 3, padding.bottom = 3, part = "all") %>%
+    width(j = seq_along(vLarguras), width = vLarguras / 2.54) %>%
+    set_table_properties(layout = "fixed")
+  ftTabela
+}
+
+# Acrescenta a tabela ao documento Word com legenda numerada acima ("Tabela N – título",
+# reconhecida pela lista de tabelas do Word) e fonte abaixo, em Times New Roman 10
+fAdicionarTabelaWord <- function(docWord, ftTabela, sTitulo, sFonte, sFonteLetra = "Times New Roman") {
+  fpTexto <- fp_text(font.family = sFonteLetra, font.size = 10)
+  docWord <- body_add_fpar(docWord, fpar(
+    run_autonum(seq_id = "table", pre_label = "Tabela ", post_label = " – ", prop = fpTexto),
+    ftext(sTitulo, prop = fpTexto),
+    fp_p = fp_par(text.align = "left", padding.bottom = 4)))
+  docWord <- body_add_flextable(docWord, ftTabela, align = "center")
+  docWord <- body_add_fpar(docWord, fpar(ftext(paste("Fonte:", sFonte), prop = fpTexto),
+                                         fp_p = fp_par(text.align = "left", padding.top = 4)))
+  body_add_par(docWord, "")
+}
+
+# --- Figuras ---
+
+# Versão de um gráfico para inserir no Word: retira título, subtítulo e notas de
+# dentro da imagem (no padrão ABNT eles ficam no documento, acima e abaixo da figura)
+# e aumenta os textos, que diminuem quando a figura é ajustada à largura da página.
+fVersaoDocumento <- function(gGrafico, nEscalaTexto = 1.35, nTamanhoLegenda = 10) {
+  gDoc <- gGrafico + labs(title = NULL, subtitle = NULL, caption = NULL)
+  bTitulo <- sapply(gDoc$layers, function(l) {
+    is.data.frame(l$data) && "label" %in% names(l$data) && any(grepl("^Brasil:", l$data$label))
+  })
+  gDoc$layers <- gDoc$layers[!bTitulo]
+  for (k in seq_along(gDoc$layers)) {
+    if (inherits(gDoc$layers[[k]]$geom, c("GeomText", "GeomTextRepel", "GeomLabel")) &&
+        !is.null(gDoc$layers[[k]]$aes_params$size)) {
+      gDoc$layers[[k]]$aes_params$size <- gDoc$layers[[k]]$aes_params$size * nEscalaTexto
+    }
+  }
+  gDoc + theme(legend.text = element_text(size = nTamanhoLegenda),
+               legend.title = element_text(face = "bold", size = nTamanhoLegenda + 0.5))
+}
+
+# Acrescenta uma figura ao documento Word no padrão ABNT: "Figura N – título" acima
+# (numeração automática do Word), imagem centralizada com a largura do texto e,
+# abaixo, fonte e nota em Times New Roman 10.
+fAdicionarFiguraWord <- function(docWord, sImagem, sTitulo, sFonte, sNota, nLarguraCm = 16,
+                                 nAlturaCm, sFonteLetra = "Times New Roman") {
+  fpTexto <- fp_text(font.family = sFonteLetra, font.size = 10)
+  docWord <- body_add_fpar(docWord, fpar(
+    run_autonum(seq_id = "fig", pre_label = "Figura ", post_label = " – ", prop = fpTexto),
+    ftext(sTitulo, prop = fpTexto),
+    fp_p = fp_par(text.align = "center", padding.bottom = 4)))
+  docWord <- body_add_img(docWord, src = sImagem, style = "centered",
+                          width = nLarguraCm / 2.54, height = nAlturaCm / 2.54)
+  docWord <- body_add_fpar(docWord, fpar(ftext(paste("Fonte:", sFonte), prop = fpTexto),
+                                         fp_p = fp_par(text.align = "left", padding.top = 4)))
+  docWord <- body_add_fpar(docWord, fpar(ftext(paste("Nota:", sNota), prop = fpTexto),
+                                         fp_p = fp_par(text.align = "justify")))
+  body_add_par(docWord, "")
+}
+
+# Nomes curtos dos setores não intensivos nos gráficos
+fNomeCurto <- function(s) {
+  s <- sub("^Comércio por atacado e a varejo.*", "Comércio (atacado e varejo)", s)
+  s <- sub("^Outros serviços administrativos.*", "Outros serviços administrativos", s)
+  s <- sub(",.*$", "", s)
+  ifelse(nchar(s) > 32, paste0(substr(s, 1, 31), "."), s)
+}
+```
+
+# 4. Cálculo dos indicadores de insumo-produto
+
+Índices de Hirschman-Rasmussen, índices puros (GHS) e campo de influência, calculados para os 68 setores e normalizados pela média dos 68. O campo de influência leva cerca de 20 segundos.
+
+```{r calculo-indicadores}
+
+fVerificarObjetos(c("mZ", "mA", "mLeontief", "vX", "nSetores", "lCodigoSetores",
+                    "dReferencia", "dEsforco_C2"))
+lNomes <- dReferencia$setor_morceiro
+
+# Demanda final doméstica de cada setor: y = X - Z i
+# (identidade conferida no Script 01: demanda total de cada linha = X)
+vY <- vX - rowSums(mZ)
+
+# Setores intensivos em tecnologia (índice de esforço tecnológico > 1)
+dIntensivos <- dEsforco_C2[dEsforco_C2$Intensivo == "Sim", ]
+vIdxTec <- match(dIntensivos$Codigo, lCodigoSetores)      # ordenados pelo esforço
+# Setores não intensivos em tecnologia (IE <= 1), também ordenados pelo esforço
+dNaoIntensivos <- dEsforco_C2[dEsforco_C2$Intensivo != "Sim", ]
+vIdxNaoTec <- match(dNaoIntensivos$Codigo, lCodigoSetores)
+vIE <- dEsforco_C2$Esforco_tecnologico[match(lCodigoSetores, dEsforco_C2$Codigo)]
+cat("Setores intensivos em tecnologia:", length(vIdxTec),
+    "| não intensivos:", length(vIdxNaoTec), "\n")
+stopifnot(length(vIdxTec) + length(vIdxNaoTec) == nSetores)
+
+#################################################################################
+# 1. Índices de ligação de Hirschman-Rasmussen
+#################################################################################
+# U_j (para trás)  = média da coluna j de B / média de todos os elementos de B
+# U_i (para frente) = média da linha i de B / média de todos os elementos de B
+mB <- mLeontief
+vMediaLinhasB  <- rowMeans(mB)
+vMediaColunasB <- colMeans(mB)
+nMediaB <- sum(mB) / nSetores^2
+
+vLigacaoTras   <- vMediaColunasB / nMediaB
+vLigacaoFrente <- vMediaLinhasB / nMediaB
+
+# Coeficientes de variação (dispersão dos encadeamentos)
+vVj <- colSds(mB) / vMediaColunasB    # para trás
+vVi <- rowSds(mB) / vMediaLinhasB     # para frente
+
+dLigacoesHR <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomes, Esforco_tecnologico = vIE,
+  Ligacao_tras = vLigacaoTras, Ligacao_frente = vLigacaoFrente,
+  CV_tras = vVj, CV_frente = vVi,
+  Classificacao = fClassificacaoHR(vLigacaoTras, vLigacaoFrente)
+)
+
+#################################################################################
+# 2. Índices puros de ligação (GHS)
+#################################################################################
+# Para cada setor j, a economia é dividida em j e no restante (r):
+#   PBL_j = soma( Dr Arj Dj yj )   impacto da produção de j sobre o restante
+#   PFL_j = soma( Dj Ajr Dr yr )   impacto da produção do restante sobre j
+#   Dj = (1 - Ajj)^-1 ; Dr = (I - Arr)^-1
+mIndicePuro <- matrix(0, nrow = nSetores, ncol = 3)
+for (s in 1:nSetores) {
+  vDemais <- rep(TRUE, nSetores); vDemais[s] <- FALSE
+  nYj <- vY[s]
+  vYr <- matrix(vY[vDemais], ncol = 1)
+  nDj <- 1 / (1 - mA[s, s])
+  vAjr <- mA[s, vDemais, drop = FALSE]
+  vArj <- mA[vDemais, s, drop = FALSE]
+  mDr  <- solve(diag(nSetores - 1) - mA[vDemais, vDemais])
+  nPBL <- sum(mDr %*% vArj * nDj * nYj)
+  nPFL <- sum(nDj * vAjr %*% mDr %*% vYr)
+  mIndicePuro[s, ] <- c(nPBL, nPFL, nPBL + nPFL)
+}
+mIndicePuroNormal <- t(t(mIndicePuro) / colMeans(mIndicePuro))   # normalizado pela média
+
+dIndicesPuros <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomes, Esforco_tecnologico = vIE,
+  PBL = mIndicePuro[, 1], PFL = mIndicePuro[, 2], PTL = mIndicePuro[, 3],
+  PBLN = mIndicePuroNormal[, 1], PFLN = mIndicePuroNormal[, 2], PTLN = mIndicePuroNormal[, 3]
+)
+stopifnot(max(abs(dIndicesPuros$PTL - dIndicesPuros$PBL - dIndicesPuros$PFL)) < 1e-6)
+
+#################################################################################
+# 3. Campo de influência
+#################################################################################
+# Para cada coeficiente a_ij: F(e_ij) = (B(e_ij) - B) / e,  S_ij = soma(F^2)
+nIncremento <- 0.001
+mI <- diag(nSetores)
+mCampoInfluencia <- matrix(0, nrow = nSetores, ncol = nSetores)
+for (r in 1:nSetores) {
+  for (c in 1:nSetores) {
+    mA_inc <- mA
+    mA_inc[r, c] <- mA_inc[r, c] + nIncremento
+    mFE <- (solve(mI - mA_inc) - mB) / nIncremento
+    mCampoInfluencia[r, c] <- sum(mFE * mFE)
+  }
+}
+dimnames(mCampoInfluencia) <- list(lCodigoSetores, lCodigoSetores)
+
+nMediaS <- mean(mCampoInfluencia)
+nDPS <- sd(mCampoInfluencia)
+mCategoria <- ifelse(mCampoInfluencia < nMediaS, 0,
+                     ifelse(mCampoInfluencia < nMediaS + nDPS, 1,
+                            ifelse(mCampoInfluencia < nMediaS + 2 * nDPS, 2, 3)))
+
+# Síntese por setor: influência como vendedor (linha) e como comprador (coluna)
+vSomaLinha  <- rowSums(mCampoInfluencia)
+vSomaColuna <- colSums(mCampoInfluencia)
+dCampoInfluencia <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomes, Esforco_tecnologico = vIE,
+  Influencia_vendas = vSomaLinha / mean(vSomaLinha),
+  Influencia_compras = vSomaColuna / mean(vSomaColuna),
+  N_elevados_vendas = rowSums(mCategoria >= 2),
+  N_elevados_compras = colSums(mCategoria >= 2),
+  Maior_ligacao_vendas = lNomes[apply(mCampoInfluencia, 1, which.max)],
+  Maior_ligacao_compras = lNomes[apply(mCampoInfluencia, 2, which.max)]
+)
+
+#################################################################################
+# 4. Síntese dos indicadores
+#################################################################################
+dSinteseIP <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomes, Esforco_tecnologico = vIE,
+  Ligacao_tras = vLigacaoTras, Ligacao_frente = vLigacaoFrente,
+  Classificacao_HR = dLigacoesHR$Classificacao,
+  PBLN = mIndicePuroNormal[, 1], PFLN = mIndicePuroNormal[, 2], PTLN = mIndicePuroNormal[, 3],
+  Influencia_vendas = dCampoInfluencia$Influencia_vendas,
+  Influencia_compras = dCampoInfluencia$Influencia_compras,
+  Intensivo_tecnologia = ifelse(seq_len(nSetores) %in% vIdxTec, "Sim", "Não")
+)
+
+cat("\nSetores intensivos em tecnologia - classificação de Hirschman-Rasmussen:\n")
+print(table(dLigacoesHR$Classificacao[vIdxTec]))
+cat("\nSetores não intensivos em tecnologia - classificação de Hirschman-Rasmussen:\n")
+print(table(dLigacoesHR$Classificacao[vIdxNaoTec]))
+cat("Setores-chave entre os intensivos:",
+    paste(lNomes[vIdxTec][dLigacoesHR$Classificacao[vIdxTec] == "Setor-chave"], collapse = "; "), "\n")
+```
+
+# 5. Tabelas
+
+## 5.1 Setores intensivos em tecnologia
+
+```{r tabelas-intensivos}
+fVerificarObjetos(c("dSinteseIP", "vIdxTec", "mCampoInfluencia", "mCategoria",
+                    "dEsforco_C2", "lCodigoSetores"))
+
+nSetoresTec <- length(vIdxTec)
+dTec <- dSinteseIP[vIdxTec, ]
+dTec$N <- seq_len(nSetoresTec)          # numeração pelo esforço tecnológico
+
+sFonteTabela <- paste("Elaboração própria a partir da MIP 2018 (NEREUS/USP).",
+                      "Setores com índice de esforço tecnológico > 1, ordenados pelo esforço;",
+                      "índices normalizados pela média dos 68 setores.")
+
+#################################################################################
+# 1. Tabela - índices de ligação de Hirschman-Rasmussen
+#################################################################################
+dTabelaHR <- dTec %>%
+  transmute(`Nº` = N, Setor,
+            `Índice de Ligação para Trás` = Ligacao_tras,
+            `Índice de Ligação para Frente` = Ligacao_frente)
+kTabelaHR <- fTabelaKable(dTabelaHR,
+                          "Índices de Ligação de Hirschman-Rasmussen dos Setores Intensivos em Tecnologia (2018)",
+                          sFonteTabela)
+print(kTabelaHR)    # aparece no Viewer do RStudio
+
+#################################################################################
+# 2. Tabela - índices puros de ligação normalizados (GHS)
+#################################################################################
+dTabelaGHS <- dTec %>%
+  transmute(`Nº` = N, Setor,
+            `Índice Puro de Ligação Normalizado para Trás` = PBLN,
+            `Índice Puro de Ligação Normalizado para Frente` = PFLN,
+            `Índice Puro Total de Ligações Normalizado` = PTLN)
+kTabelaGHS <- fTabelaKable(dTabelaGHS,
+                           "Índices Puros de Ligação dos Setores Intensivos em Tecnologia (2018)",
+                           sFonteTabela)
+print(kTabelaGHS)
+```
+
+## 5.2 Setores não intensivos em tecnologia
+
+```{r tabelas-nao-intensivos}
+fVerificarObjetos(c("dSinteseIP", "vIdxNaoTec"))
+
+# Setores NÃO intensivos em tecnologia (IE <= 1), ordenados pelo esforço tecnológico
+nSetoresNaoTec <- length(vIdxNaoTec)
+dNaoTec <- dSinteseIP[vIdxNaoTec, ]
+dNaoTec$N <- seq_len(nSetoresNaoTec)
+stopifnot(all(dNaoTec$Intensivo_tecnologia == "Não"))
+cat("Setores NÃO intensivos em tecnologia:", nSetoresNaoTec, "\n")
+
+sFonteNaoTec <- paste("Elaboração própria a partir da MIP 2018 (NEREUS/USP).",
+                      "Setores NÃO intensivos em tecnologia (índice de esforço tecnológico <= 1),",
+                      "ordenados pelo esforço; índices normalizados pela média dos 68 setores.")
+
+#################################################################################
+# 1. Tabela - índices de ligação de Hirschman-Rasmussen (setores NÃO intensivos)
+#################################################################################
+dTabelaHR_NaoTec <- dNaoTec %>%
+  transmute(`Nº` = N, Setor,
+            `Índice de Ligação para Trás` = Ligacao_tras,
+            `Índice de Ligação para Frente` = Ligacao_frente)
+kTabelaHR_NaoTec <- fTabelaKable(dTabelaHR_NaoTec,
+                                 "Índices de Ligação de Hirschman-Rasmussen dos Setores Não Intensivos em Tecnologia (2018)",
+                                 sFonteNaoTec)
+print(kTabelaHR_NaoTec)    # aparece no Viewer do RStudio
+
+#################################################################################
+# 2. Tabela - índices puros de ligação normalizados (setores NÃO intensivos)
+#################################################################################
+dTabelaGHS_NaoTec <- dNaoTec %>%
+  transmute(`Nº` = N, Setor,
+            `Índice Puro de Ligação Normalizado para Trás` = PBLN,
+            `Índice Puro de Ligação Normalizado para Frente` = PFLN,
+            `Índice Puro Total de Ligações Normalizado` = PTLN)
+kTabelaGHS_NaoTec <- fTabelaKable(dTabelaGHS_NaoTec,
+                                  "Índices Puros de Ligação dos Setores Não Intensivos em Tecnologia (2018)",
+                                  sFonteNaoTec)
+print(kTabelaGHS_NaoTec)
+```
+
+# 6. Gráficos
+
+## 6.1 Rede de coeficientes técnicos entre os setores intensivos
+
+```{r rede-intensivos, fig.width = 13, fig.height = 7}
+#################################################################################
+# 3. Rede de coeficientes técnicos entre os 25 setores intensivos (estilo Product Space)
+#################################################################################
+# Nomes curtos para o gráfico (pelo código do setor)
+lNomesCurtos <- c(
+  "3000" = "Outros equip. transporte", "8591" = "Educação pública",
+  "7180" = "Arquitetura, eng. e P&D", "2100" = "Farmacêuticos",
+  "2092" = "Defensivos e tintas", "2600" = "Informática e eletrônicos",
+  "6280" = "Desenv. de sistemas", "2700" = "Máquinas elétricas",
+  "2093" = "Limpeza e cosméticos", "2992" = "Peças p/ veículos",
+  "0280" = "Florestal e pesca", "1500" = "Calçados e couro",
+  "0791" = "Minério de ferro", "2991" = "Automóveis", "8691" = "Saúde pública",
+  "0191" = "Agricultura", "2300" = "Minerais não-metálicos",
+  "2800" = "Máquinas mecânicas", "1200" = "Fumo", "8592" = "Educação privada",
+  "8400" = "Adm. pública", "0580" = "Carvão e min. não-metálicos",
+  "2200" = "Borracha e plástico", "0192" = "Pecuária", "2091" = "Químicos orgânicos")
+vCodTec <- lCodigoSetores[vIdxTec]
+vNomeCurto <- ifelse(vCodTec %in% names(lNomesCurtos), lNomesCurtos[vCodTec], dTec$Setor)
+
+# Ligações pelos coeficientes técnicos a_ij (compras do setor j ao setor i por real
+# produzido por j). Rede não direcionada: para cada par vale o maior entre a_ij e a_ji.
+# Cat = 2: coeficiente >= nLimiteCoef; Cat = 3: coeficiente >= nLimiteForte.
+mAtec <- mA[vIdxTec, vIdxTec]
+diag(mAtec) <- 0
+mAU <- pmax(mAtec, t(mAtec))
+mPar <- which(upper.tri(mAU) & mAU >= nLimiteCoef / 4, arr.ind = TRUE)
+dPares <- data.frame(de = mPar[, 1], para = mPar[, 2], Coef = mAU[mPar])
+dPares$Cat <- ifelse(dPares$Coef >= nLimiteForte, 3, ifelse(dPares$Coef >= nLimiteCoef, 2, 1))
+
+# Posição dos nós: algoritmo de forças (Fruchterman-Reingold) ponderado pelos
+# coeficientes (inclusive ligações um pouco abaixo do limite); formato horizontal
+gRede <- graph_from_data_frame(dPares, directed = FALSE,
+                               vertices = data.frame(id = 1:nSetoresTec))
+set.seed(7)
+mLayout <- layout_with_fr(gRede, weights = (dPares$Coef / max(dPares$Coef))^0.5, niter = 5000)
+mLayout <- apply(mLayout, 2, function(v) (v - min(v)) / diff(range(v)))
+mLayout[, 1] <- mLayout[, 1] * 2.6
+
+# Nós
+dGrupoTec <- dEsforco_C2[match(vCodTec, dEsforco_C2$Codigo), ]
+lGrupos <- c("Agropecuária", "Indústria Extrativa", "Indústria de maior intensidade tecnológica",
+             "Indústria de menor intensidade tecnológica", "Serviços privados", "Serviços públicos")
+lCoresGrupos <- c("#EDC10F", "#7A6457", "#9B2FD6", "#C8413B", "#3FC9D3", "#2EAB4F")
+# tons mais escuros das mesmas cores, para os nomes (o rótulo fica com a cor do seu círculo)
+lCoresTexto <- c("#A88600", "#5C4A40", "#6E1E9C", "#93281F", "#1E8C94", "#1E7A36")
+dNos <- data.frame(id = 1:nSetoresTec, x = mLayout[, 1], y = mLayout[, 2],
+                   Num = 1:nSetoresTec,
+                   Rotulo = paste0(1:nSetoresTec, ". ", toupper(vNomeCurto)),
+                   PTLN = dTec$PTLN, PeD = dGrupoTec$PeD_milhoes, IE = dTec$Esforco_tecnologico,
+                   Grupo = factor(dGrupoTec$Grupo, levels = lGrupos))
+# Variável que define o tamanho dos círculos e a legenda correspondente
+if (sTamanhoBolinha == "IE") {
+  dNos$Valor <- dNos$IE
+  vQuebras <- c(1, 2, 5, 10, 15)
+  vRotulosQuebras <- c("1", "2", "5", "10", "15")
+  sTituloTamanho <- "ESFORÇO TECNOLÓGICO (IE)"
+  sNotaTamanho <- "índice de esforço tecnológico (intensidade direta de P&D do setor / média da economia)"
+  vTamanhos <- c(4, 24)
+} else if (sTamanhoBolinha == "PeD") {
+  dNos$Valor <- dNos$PeD                                   # R$ milhões
+  vQuebras <- c(500, 2000, 5000, 10000)
+  vRotulosQuebras <- c("R$ 0,5 bi", "R$ 2 bi", "R$ 5 bi", "R$ 10 bi")
+  sTituloTamanho <- "GASTO EM P&D"
+  sNotaTamanho <- "gasto em P&D do setor (interna + externa, R$ de 2018)"
+  vTamanhos <- c(5.5, 24)
+} else {
+  dNos$Valor <- dNos$PTLN
+  vQuebras <- c(0.25, 0.5, 1, 2)
+  vRotulosQuebras <- c("0,25", "0,5", "1,0", "2,0")
+  sTituloTamanho <- "ÍNDICE PURO TOTAL (PTLN)"
+  sNotaTamanho <- "índice puro total de ligação normalizado (PTLN)"
+  vTamanhos <- c(5.5, 19)
+}
+# Diâmetro de cada círculo (mesma regra do scale_size), para afastar os rótulos
+vLimValor <- c(0, max(dNos$Valor))
+dNos$Tamanho <- vTamanhos[1] + diff(vTamanhos) * sqrt(dNos$Valor / vLimValor[2])
+
+# Ligações exibidas: coeficiente >= nLimiteCoef
+dLigacoes <- subset(dPares, Cat >= 2)
+dLigacoes$x <- dNos$x[dLigacoes$de];   dLigacoes$y <- dNos$y[dLigacoes$de]
+dLigacoes$xend <- dNos$x[dLigacoes$para]; dLigacoes$yend <- dNos$y[dLigacoes$para]
+
+nPeDTotal <- sum(dNos$PeD) / 1000      # R$ bilhões
+sCabecalho <- paste0(nSetoresTec, " setores | P&D total: R$ ",
+                     format(round(nPeDTotal, 1), decimal.mark = ","), " bi")
+
+# Quadro lateral com a numeração dos setores (no lugar dos nomes no gráfico)
+nXQuadro <- max(dNos$x) + 0.3
+dQuadro <- data.frame(Num = dNos$Num, Nome = vNomeCurto, Grupo = dNos$Grupo,
+                      x = nXQuadro, y = seq(1, 0, length.out = nSetoresTec))
+
+gRedeCoef <- ggplot() +
+  geom_segment(data = dLigacoes, aes(x = x, y = y, xend = xend, yend = yend,
+                                     linewidth = factor(Cat), colour = factor(Cat))) +
+  scale_linewidth_manual(values = c(`2` = 0.35, `3` = 0.9), guide = "none") +
+  scale_colour_manual(values = c(`2` = "#D9D9D9", `3` = "#9E9E9E"), guide = "none") +
+  geom_point(data = dNos, aes(x = x, y = y, size = Valor, fill = Grupo),
+             shape = 21, colour = "#8C8C8C", stroke = 0.4, alpha = 0.95) +
+  scale_size_continuous(range = vTamanhos, limits = vLimValor, breaks = vQuebras,
+                        labels = vRotulosQuebras, name = sTituloTamanho) +
+  scale_fill_manual(values = lCoresGrupos, drop = FALSE, name = "GRUPOS") +
+  geom_text(data = dNos, aes(x = x, y = y, label = Num), size = 2.9, fontface = "bold",
+            colour = ifelse(dNos$Grupo %in% c("Agropecuária", "Serviços privados"), "#262626", "white")) +
+  # quadro lateral: número (na cor do grupo) e nome do setor
+  annotate("segment", x = nXQuadro - 0.08, xend = nXQuadro - 0.08, y = -0.03, yend = 1.03,
+           colour = "#BFBFBF", linewidth = 0.4) +
+  annotate("text", x = nXQuadro - 0.035, y = 1.075, label = "Nº  SETOR", hjust = 0,
+           fontface = "bold", size = 2.9) +
+  geom_label(data = dQuadro, aes(x = x, y = y, label = sprintf("%2d", Num), fill = Grupo),
+             size = 2.3, fontface = "bold", label.size = 0, label.r = unit(0.05, "lines"),
+             label.padding = unit(0.12, "lines"), show.legend = FALSE,
+             colour = ifelse(dQuadro$Grupo %in% c("Agropecuária", "Serviços privados"), "#262626", "white")) +
+  geom_text(data = dQuadro, aes(x = x + 0.06, y = y, label = Nome), hjust = 0, size = 2.6,
+            colour = "#262626") +
+  annotate("text", x = Inf, y = Inf,
+           label = "Brasil: rede de coeficientes técnicos dos setores intensivos em tecnologia, 2018",
+           hjust = 1, vjust = -1.4, fontface = "bold", size = 4.1) +
+  coord_cartesian(xlim = c(-0.16, nXQuadro + 1.05), ylim = c(-0.09, 1.1), expand = FALSE, clip = "off") +
+  labs(title = sCabecalho,
+       caption = paste0("Fonte: elaboração própria com dados da MIP 2018 (NEREUS/USP).\n",
+                        "Nota: tamanho do círculo: ", sNotaTamanho, "; ",
+                        "numeração dos setores em ordem decrescente de esforço tecnológico, como nas tabelas;\n",
+                        "linhas: pares de setores com coeficiente técnico a_ij ou a_ji >= ", format(nLimiteCoef, decimal.mark = ","),
+                        " (cinza-escuro: >= ", format(nLimiteForte, decimal.mark = ","), "), isto é, compras de pelo menos R$ 0,02 por real produzido.")) +
+  theme_void(base_size = 11) +
+  theme(plot.background = element_rect(fill = "white", colour = NA),
+        panel.border = element_rect(fill = NA, colour = "#BFBFBF", linewidth = 0.5),
+        plot.title = element_text(face = "bold", size = 12, margin = margin(b = 6)),
+        plot.caption = element_text(hjust = 0, size = 7.5, colour = "#595959", margin = margin(t = 8)),
+        legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(1, "mm"),
+        legend.title = element_text(face = "bold", size = 9),
+        legend.text = element_text(size = 8.5), legend.key.size = unit(3.5, "mm"),
+        plot.margin = margin(12, 14, 10, 14)) +
+  guides(fill = guide_legend(nrow = 1, order = 1,
+                             override.aes = list(size = 4.5, shape = 22, colour = NA)),
+         size = guide_legend(nrow = 1, order = 2,
+                             override.aes = list(fill = "#D9D9D9", colour = "#8C8C8C")))
+print(gRedeCoef)
+
+cat("Rede de coeficientes (25 setores): ligações exibidas:", nrow(dLigacoes),
+    "| fortes:", sum(dLigacoes$Cat == 3), "\n")
+```
+
+## 6.2 Rede de coeficientes técnicos com a economia (68 setores)
+
+```{r rede-economia, fig.width = 14, fig.height = 8}
+#################################################################################
+# 4. Rede de coeficientes técnicos dos setores intensivos com a economia (68 setores)
+#################################################################################
+# Mostra as ligações (a_ij ou a_ji >= nLimiteCoef) em que pelo menos um dos lados é
+# um setor intensivo em tecnologia; os 43 setores não intensivos aparecem em cinza,
+# como os produtos não exportados no Product Space.
+nTodos <- nrow(mA)
+vEhTec <- seq_len(nTodos) %in% vIdxTec
+mA68 <- mA
+diag(mA68) <- 0
+mAU68 <- pmax(mA68, t(mA68))
+mPar68 <- which(upper.tri(mAU68) & mAU68 >= nLimiteCoef / 4, arr.ind = TRUE)
+dPares68 <- data.frame(de = mPar68[, 1], para = mPar68[, 2], Coef = mAU68[mPar68])
+dPares68$Cat <- ifelse(dPares68$Coef >= nLimiteForte, 3, ifelse(dPares68$Coef >= nLimiteCoef, 2, 1))
+
+# Setores sem nenhuma ligação na economia (ex.: Serviços domésticos) ficam fora do gráfico
+vComLigacao <- seq_len(nTodos) %in% c(dPares68$de, dPares68$para) | vEhTec
+
+# Posição: forças com as ligações de toda a economia (inclusive entre não intensivos)
+gRede68 <- graph_from_data_frame(dPares68, directed = FALSE, vertices = data.frame(id = 1:nTodos))
+set.seed(11)
+mLayout68 <- layout_with_fr(gRede68, weights = (dPares68$Coef / max(dPares68$Coef))^0.5, niter = 5000)
+mLayout68 <- apply(mLayout68, 2, function(v) (v - min(v[vComLigacao])) / diff(range(v[vComLigacao])))
+mLayout68[, 1] <- mLayout68[, 1] * 2.6
+
+# Nós: intensivos coloridos pelo grupo, com o mesmo tamanho do gráfico anterior; demais em cinza
+vValor68 <- rep(NA_real_, nTodos); vValor68[vIdxTec] <- dNos$Valor
+vNumTec <- rep(NA_integer_, nTodos); vNumTec[vIdxTec] <- seq_len(nSetoresTec)
+dGrupo68 <- dEsforco_C2[match(lCodigoSetores, dEsforco_C2$Codigo), ]
+vGrupo68 <- ifelse(vEhTec, dGrupo68$Grupo, "Setores não intensivos em tecnologia")
+vNumLigTec <- sapply(seq_len(nTodos), function(k) sum(mAU68[k, vIdxTec] >= nLimiteCoef))   # ligações com intensivos
+# nomeia os 10 setores não intensivos com mais ligações com os intensivos
+nCorteRotulo <- sort(vNumLigTec[!vEhTec], decreasing = TRUE)[10]
+dNos68 <- data.frame(id = 1:nTodos, x = mLayout68[, 1], y = mLayout68[, 2],
+                     PeD = pmax(dGrupo68$PeD_milhoes, 0),
+                     Grupo = factor(vGrupo68, levels = c(lGrupos, "Setores não intensivos em tecnologia")),
+                     Tec = vEhTec, Valor = vValor68, Num = vNumTec, LigTec = vNumLigTec)
+dNos68$Rotulo <- ifelse(vEhTec, paste0(vNumTec, ". ", toupper(vNomeCurto[match(seq_len(nTodos), vIdxTec)])),
+                        ifelse(vNumLigTec >= nCorteRotulo & vNumLigTec > 0, fNomeCurto(dSinteseIP$Setor), ""))
+# mesma escala de tamanho do gráfico anterior
+dNos68$Tamanho <- ifelse(vEhTec, vTamanhos[1] + diff(vTamanhos) *
+                           sqrt(pmax(dNos68$Valor, 0) / vLimValor[2]), 3.2)
+
+# Ligações exibidas: só as que envolvem pelo menos um setor intensivo
+dLig68 <- subset(dPares68, Cat >= 2 & (vEhTec[de] | vEhTec[para]))
+dLig68$Tipo <- ifelse(vEhTec[dLig68$de] & vEhTec[dLig68$para], "Entre intensivos", "Intensivo com não intensivo")
+dLig68$x <- dNos68$x[dLig68$de];   dLig68$y <- dNos68$y[dLig68$de]
+dLig68$xend <- dNos68$x[dLig68$para]; dLig68$yend <- dNos68$y[dLig68$para]
+dLig68 <- dLig68[order(dLig68$Cat), ]
+dNos68 <- dNos68[vComLigacao, ]   # retira do gráfico setores sem nenhuma ligação
+
+# Numeração dos 10 setores não intensivos destacados: a mesma do mapa de calor
+# (26 a 68 = numeração das tabelas dos setores não intensivos + 25)
+vNumNaoTec <- rep(NA_integer_, nTodos); vNumNaoTec[vIdxNaoTec] <- nSetoresTec + seq_along(vIdxNaoTec)
+dNos68$Destaque <- !dNos68$Tec & dNos68$Rotulo != ""
+dNos68$Num[dNos68$Destaque] <- vNumNaoTec[dNos68$id[dNos68$Destaque]]
+dNos68$Nome <- ifelse(dNos68$Tec, vNomeCurto[match(dNos68$id, vIdxTec)], fNomeCurto(dSinteseIP$Setor[dNos68$id]))
+
+# Quadro lateral: 25 intensivos, um subtítulo e os não intensivos destacados
+dQ68Tec <- dNos68[dNos68$Tec, ]; dQ68Tec <- dQ68Tec[order(dQ68Tec$Num), ]
+dQ68Nao <- dNos68[dNos68$Destaque, ]; dQ68Nao <- dQ68Nao[order(dQ68Nao$Num), ]
+nLinhasQ <- nrow(dQ68Tec) + 1 + nrow(dQ68Nao)
+vYQ <- seq(1, 0, length.out = nLinhasQ)
+dQuadro68 <- rbind(data.frame(Num = dQ68Tec$Num, Nome = dQ68Tec$Nome, Grupo = dQ68Tec$Grupo,
+                              y = vYQ[seq_len(nrow(dQ68Tec))]),
+                   data.frame(Num = dQ68Nao$Num, Nome = dQ68Nao$Nome, Grupo = dQ68Nao$Grupo,
+                              y = vYQ[nrow(dQ68Tec) + 1 + seq_len(nrow(dQ68Nao))]))
+nYSubtitulo <- vYQ[nrow(dQ68Tec) + 1]
+nXQ68 <- max(dNos68$x) + 0.3
+dQuadro68$x <- nXQ68
+
+gRedeCoefEconomia <- ggplot() +
+  geom_segment(data = dLig68, aes(x = x, y = y, xend = xend, yend = yend,
+                                  linewidth = factor(Cat), colour = factor(Cat))) +
+  scale_linewidth_manual(values = c(`2` = 0.3, `3` = 0.75), guide = "none") +
+  scale_colour_manual(values = c(`2` = "#E0E0E0", `3` = "#A6A6A6"), guide = "none") +
+  geom_point(data = dNos68[!dNos68$Tec & !dNos68$Destaque, ], aes(x = x, y = y, fill = Grupo), size = 3.2,
+             shape = 21, colour = "#A6A6A6", stroke = 0.4) +
+  geom_point(data = dNos68[dNos68$Destaque, ], aes(x = x, y = y, fill = Grupo), size = 6,
+             shape = 21, colour = "#8C8C8C", stroke = 0.4) +
+  geom_text(data = dNos68[dNos68$Destaque, ], aes(x = x, y = y, label = Num), size = 2.3,
+            fontface = "bold", colour = "#595959") +
+  geom_point(data = dNos68[dNos68$Tec, ], aes(x = x, y = y, size = Valor, fill = Grupo),
+             shape = 21, colour = "#8C8C8C", stroke = 0.4, alpha = 0.95) +
+  scale_size_continuous(range = vTamanhos, limits = vLimValor, breaks = vQuebras,
+                        labels = vRotulosQuebras, name = sTituloTamanho) +
+  scale_fill_manual(values = c(lCoresGrupos, "#EFEFEF"), drop = FALSE, name = "GRUPOS") +
+  geom_text(data = dNos68[dNos68$Tec, ], aes(x = x, y = y, label = Num), size = 2.7, fontface = "bold",
+            colour = ifelse(dNos68$Grupo[dNos68$Tec] %in% c("Agropecuária", "Serviços privados"), "#262626", "white")) +
+  # quadro lateral com a numeração
+  annotate("segment", x = nXQ68 - 0.08, xend = nXQ68 - 0.08, y = -0.02, yend = 1.02,
+           colour = "#BFBFBF", linewidth = 0.4) +
+  annotate("text", x = nXQ68 - 0.035, y = 1.055, label = "Nº  SETOR", hjust = 0,
+           fontface = "bold", size = 2.7) +
+  annotate("text", x = nXQ68 - 0.035, y = nYSubtitulo, label = "Não intensivos destacados", hjust = 0,
+           fontface = "bold.italic", size = 2.3, colour = "#595959") +
+  geom_label(data = dQuadro68, aes(x = x, y = y, label = sprintf("%2d", Num), fill = Grupo),
+             size = 2.1, fontface = "bold", label.size = 0, label.r = unit(0.05, "lines"),
+             label.padding = unit(0.1, "lines"), show.legend = FALSE,
+             colour = ifelse(dQuadro68$Grupo %in% c("Agropecuária", "Serviços privados",
+                                                    "Setores não intensivos em tecnologia"), "#262626", "white")) +
+  geom_text(data = dQuadro68, aes(x = x + 0.065, y = y, label = Nome), hjust = 0, size = 2.35,
+            colour = "#262626") +
+  annotate("text", x = Inf, y = Inf,
+           label = "Brasil: coeficientes técnicos dos setores intensivos em tecnologia com a economia, 2018",
+           hjust = 1, vjust = -1.4, fontface = "bold", size = 4.1) +
+  coord_cartesian(xlim = c(-0.08, nXQ68 + 1.1), ylim = c(-0.06, 1.08), expand = FALSE, clip = "off") +
+  labs(title = paste0("68 setores | ", nSetoresTec, " intensivos em tecnologia | ",
+                      nrow(dLig68), " ligações"),
+       caption = paste0("Fonte: elaboração própria com dados da MIP 2018 (NEREUS/USP).\n",
+                        "Nota: tamanho do círculo dos setores intensivos: ", sNotaTamanho, "; ",
+                        "numeração em ordem decrescente de esforço tecnológico, como nas tabelas;\n",
+                        "setores não intensivos em cinza (numerados os 10 com mais ligações com intensivos, na numeração do mapa de calor);\n",
+                        "linhas: pares com coeficiente técnico a_ij ou a_ji >= ", format(nLimiteCoef, decimal.mark = ","), " com pelo menos um setor intensivo ",
+                        "(cinza-escuro: >= ", format(nLimiteForte, decimal.mark = ","), ").")) +
+  theme_void(base_size = 11) +
+  theme(plot.background = element_rect(fill = "white", colour = NA),
+        panel.border = element_rect(fill = NA, colour = "#BFBFBF", linewidth = 0.5),
+        plot.title = element_text(face = "bold", size = 12, margin = margin(b = 6)),
+        plot.caption = element_text(hjust = 0, size = 7.5, colour = "#595959", margin = margin(t = 8)),
+        legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(1, "mm"),
+        legend.title = element_text(face = "bold", size = 9),
+        legend.text = element_text(size = 8.5), legend.key.size = unit(3.5, "mm"),
+        plot.margin = margin(12, 14, 10, 14)) +
+  guides(fill = guide_legend(nrow = 2, order = 1,
+                             override.aes = list(size = 4.5, shape = 22, colour = NA)),
+         size = guide_legend(nrow = 1, order = 2,
+                             override.aes = list(fill = "#D9D9D9", colour = "#8C8C8C")))
+print(gRedeCoefEconomia)
+
+cat("Rede com a economia: ligações exibidas:", nrow(dLig68),
+    "| entre intensivos:", sum(dLig68$Tipo == "Entre intensivos"),
+    "| intensivo com não intensivo:", sum(dLig68$Tipo != "Entre intensivos"), "\n")
+```
+
+## 6.3 Campo de influência: mapa de calor (68 x 68)
+
+```{r mapa-calor, fig.width = 12.5, fig.height = 10}
+#################################################################################
+# 4B. Campo de influência: mapa de calor da economia completa (68 x 68)
+#################################################################################
+# Matriz S classificada em quatro faixas (média e desvio-padrão da matriz 68 x 68).
+# Ordem dos eixos: primeiro os 25 setores intensivos (1 a 25, como nas tabelas do
+# Script 06), depois os 43 não intensivos (26 a 68 = numeração das tabelas do
+# Script 07 + 25). Eixo horizontal = setor vendedor (i); eixo vertical = setor comprador (j).
+fVerificarObjetos("vIdxNaoTec")
+vOrdemCalor <- c(vIdxTec, vIdxNaoTec)
+nTec <- length(vIdxTec)
+mCatOrd <- mCategoria[vOrdemCalor, vOrdemCalor]
+dCalor <- expand.grid(Linha = seq_len(nTodos), Coluna = seq_len(nTodos))
+dCalor$Faixa <- factor(mCatOrd[cbind(dCalor$Linha, dCalor$Coluna)], levels = 0:3,
+                       labels = c("Elo fraco\n(abaixo da média)",
+                                  "Elo acima da média\n(entre a média e a média + 1 DP)",
+                                  "Elo forte\n(entre a média + 1 DP e a média + 2 DP)",
+                                  "Elo muito forte\n(acima da média + 2 DP)"))
+sCorTec <- "#1F4E79"
+vCorEixo <- ifelse(seq_len(nTodos) <= nTec, sCorTec, "#595959")
+vFaceEixo <- ifelse(seq_len(nTodos) <= nTec, "bold", "plain")
+
+# Convenção de Vale e Perobelli (2020, p. 100-103): eixo horizontal = setor vendedor (i),
+# eixo vertical = setor comprador (j)
+gCampoCalor <- ggplot(dCalor, aes(x = Linha, y = Coluna, fill = Faixa)) +
+  geom_tile(colour = "#E6E6E6", linewidth = 0.15) +
+  # elo fraco em branco; acima da média amarelo, forte laranja, muito forte vermelho
+  scale_fill_manual(values = c("#FFFFFF", "#FFE34D", "#FF9A1F", "#D7191C"), drop = FALSE,
+                    name = "Intensidade do elo") +
+  guides(fill = guide_legend(override.aes = list(colour = "#8C8C8C", linewidth = 0.3),
+                             byrow = TRUE)) +
+  # destaque do bloco dos setores intensivos
+  annotate("rect", xmin = 0.5, xmax = nTec + 0.5, ymin = 0.5, ymax = nTodos + 0.5,
+           fill = NA, colour = sCorTec, linewidth = 0.6) +
+  annotate("rect", xmin = 0.5, xmax = nTodos + 0.5, ymin = 0.5, ymax = nTec + 0.5,
+           fill = NA, colour = sCorTec, linewidth = 0.6) +
+  annotate("text", x = (nTec + 1) / 2, y = nTodos + 2.2, label = "Intensivos em tecnologia",
+           colour = sCorTec, fontface = "bold", size = 3.2) +
+  annotate("text", x = (nTec + nTodos + 1) / 2, y = nTodos + 2.2, label = "Não intensivos",
+           colour = "#595959", fontface = "bold", size = 3.2) +
+  scale_x_continuous(breaks = seq_len(nTodos), expand = c(0, 0)) +
+  scale_y_continuous(breaks = seq_len(nTodos), expand = c(0, 0)) +
+  coord_fixed(xlim = c(0.5, nTodos + 0.5), ylim = c(0.5, nTodos + 0.5), clip = "off") +
+  labs(title = "Campo de Influência", subtitle = "2018",
+       x = "Setores (vendedor i)", y = "Setores (comprador j)",
+       caption = paste0("Fonte: elaboração própria com dados da MIP 2018 (NEREUS/USP).\n",
+                        "Nota: setores 1 a ", nTec, " (em azul): intensivos em tecnologia, na numeração das tabelas dos setores intensivos;\n",
+                        "setores ", nTec + 1, " a ", nTodos, ": não intensivos, na numeração das tabelas dos setores não intensivos + ", nTec,
+                        ". Faixas definidas pela média e pelo desvio-padrão da matriz 68 x 68.")) +
+  theme_minimal(base_size = 10) +
+  theme(plot.background = element_rect(fill = "#E3EDF9", colour = "#9DB5D3"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14),
+        plot.subtitle = element_text(hjust = 0.5, face = "bold", margin = margin(b = 14)),
+        axis.title = element_text(face = "bold", size = 9),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5.5,
+                                   colour = vCorEixo, face = vFaceEixo),
+        axis.text.y = element_text(size = 5.5, colour = vCorEixo, face = vFaceEixo),
+        legend.background = element_rect(fill = "white", colour = "grey70"),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(size = 8, lineheight = 0.95),
+        legend.key.height = unit(9, "mm"),
+        plot.caption = element_text(hjust = 0, size = 7),
+        plot.margin = margin(10, 10, 10, 10))
+suppressWarnings(print(gCampoCalor))
+```
+
+# 7. Exportação
+
+Só roda se `bExportarResultados = TRUE`. Os arquivos vão para a pasta `Outputs`.
+
+## 7.1 Excel com todos os indicadores
+
+```{r exportar-excel}
+sFonteNota <- "Fonte: elaboração própria a partir da MIP 2018 (NEREUS/USP) e dos indicadores de P&D desta pesquisa."
+
+# Exporta as tabelas de um grupo de setores (intensivos ou não intensivos)
+#   vIdxTec      : posições dos setores do grupo (ordenados pelo IE)
+#   sGrupo       : complemento dos títulos (ex.: "DOS SETORES INTENSIVOS EM TECNOLOGIA")
+#   sNotaSetores : nota que descreve o grupo
+#   sArquivo     : nome do arquivo em ./Outputs
+#   bIncluir68   : inclui a aba com os 68 setores
+fExportarIndicadores <- function(vIdxTec, sGrupo, sNotaSetores, sArquivo, bIncluir68 = FALSE) {
+  dir.create("Outputs", showWarnings = FALSE)
+  wb <- createWorkbook()
+
+  # 5.1 Síntese
+  dTab <- dSinteseIP[vIdxTec, c("Setor", "Esforco_tecnologico", "Ligacao_tras", "Ligacao_frente",
+                                "Classificacao_HR", "PBLN", "PFLN", "PTLN",
+                                "Influencia_vendas", "Influencia_compras")]
+  fEscreverTabela(wb, "Sintese",
+                  paste0("INDICADORES DE INSUMO-PRODUTO ", sGrupo, " (2018)"),
+                  dTab,
+                  c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                    "Esforço Tecnológico (IE)", "Ligação para trás (HR)", "Ligação para frente (HR)",
+                    "Classificação (HR)", "Índice puro para trás (PBLN)", "Índice puro para frente (PFLN)",
+                    "Índice puro total (PTLN)", "Campo de influência: vendas", "Campo de influência: compras"),
+                  c("@", "0.00", "0.00", "0.00", "@", "0.00", "0.00", "0.00", "0.00", "0.00"),
+                  c(sFonteNota, sNotaSetores,
+                    "Nota: campo de influência = soma da linha (vendas) ou da coluna (compras) da matriz S, normalizada pela média dos 68 setores."),
+                  c(52, 10, 10, 10, 26, 11, 11, 11, 11, 11), vDestaque = c(3, 4, 6, 7, 8, 9, 10))
+
+  # 5.2 Índices de ligação de Hirschman-Rasmussen
+  dTab <- dLigacoesHR[vIdxTec, c("Setor", "Esforco_tecnologico", "Ligacao_tras", "Ligacao_frente",
+                                 "CV_tras", "CV_frente", "Classificacao")]
+  fEscreverTabela(wb, "Ligacoes HR",
+                  paste0("ÍNDICES DE LIGAÇÃO DE HIRSCHMAN-RASMUSSEN ", sGrupo, " (2018)"),
+                  dTab,
+                  c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                    "Esforço Tecnológico (IE)", "Índice de ligação para trás (Uj)",
+                    "Índice de ligação para frente (Ui)", "Coeficiente de variação para trás (Vj)",
+                    "Coeficiente de variação para frente (Vi)", "Classificação"),
+                  c("@", "0.00", "0.00", "0.00", "0.00", "0.00", "@"),
+                  c(sFonteNota, sNotaSetores,
+                    "Nota: setor-chave = índices para trás e para frente > 1. Coeficientes de variação menores indicam encadeamentos distribuídos de forma mais homogênea entre os setores."),
+                  c(52, 10, 12, 12, 12, 12, 28), vDestaque = c(3, 4))
+
+  # 5.3 Índices puros de ligação (GHS)
+  dTab <- dIndicesPuros[vIdxTec, c("Setor", "Esforco_tecnologico", "PBL", "PFL", "PTL",
+                                   "PBLN", "PFLN", "PTLN")]
+  fEscreverTabela(wb, "Indices puros GHS",
+                  paste0("ÍNDICES PUROS DE LIGAÇÃO (GHS) ", sGrupo, " (2018)"),
+                  dTab,
+                  c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                    "Esforço Tecnológico (IE)", "Índice puro para trás - PBL (R$ milhões)",
+                    "Índice puro para frente - PFL (R$ milhões)", "Índice puro total - PTL (R$ milhões)",
+                    "PBL normalizado (PBLN)", "PFL normalizado (PFLN)", "PTL normalizado (PTLN)"),
+                  c("@", "0.00", "#,##0", "#,##0", "#,##0", "0.00", "0.00", "0.00"),
+                  c(sFonteNota, sNotaSetores,
+                    "Nota: índices puros calculados segundo Guilhoto, Sonis e Hewings (1996), em valores correntes de 2018; a normalização divide cada índice pela média dos 68 setores."),
+                  c(52, 10, 13, 13, 13, 11, 11, 11), vDestaque = c(6, 7, 8))
+
+  # 5.4 Campo de influência - síntese por setor
+  dTab <- dCampoInfluencia[vIdxTec, c("Setor", "Esforco_tecnologico", "Influencia_vendas",
+                                      "Influencia_compras", "N_elevados_vendas",
+                                      "N_elevados_compras", "Maior_ligacao_vendas",
+                                      "Maior_ligacao_compras")]
+  fEscreverTabela(wb, "Campo de influencia",
+                  paste0("CAMPO DE INFLUÊNCIA ", sGrupo, " (2018)"),
+                  dTab,
+                  c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                    "Esforço Tecnológico (IE)", "Influência como vendedor (soma da linha normalizada)",
+                    "Influência como comprador (soma da coluna normalizada)",
+                    "Nº de coeficientes elevados como vendedor", "Nº de coeficientes elevados como comprador",
+                    "Ligação mais influente como vendedor (setor comprador)",
+                    "Ligação mais influente como comprador (setor fornecedor)"),
+                  c("@", "0.00", "0.00", "0.00", "0", "0", "@", "@"),
+                  c(sFonteNota, sNotaSetores,
+                    paste0("Nota: campo de influência calculado com incremento de ", nIncremento,
+                           " em cada coeficiente técnico; S_ij = soma dos quadrados de [B(e_ij) - B]/e."),
+                    "Nota: coeficientes elevados = S_ij acima da média + 1 desvio-padrão da matriz S (68 x 68)."),
+                  c(52, 10, 13, 13, 12, 12, 40, 40), vDestaque = c(3, 4))
+
+  # 5.5 Campo de influência - matriz entre os setores intensivos em tecnologia
+  sAba <- "Matriz campo influencia"
+  addWorksheet(wb, sAba, gridLines = FALSE)
+  sFonte <- "Times New Roman"
+  writeData(wb, sAba, paste0("CAMPO DE INFLUÊNCIA ENTRE OS SETORES ", sub("^DOS SETORES ", "", sGrupo), " (2018) - MATRIZ S (LINHA: VENDEDOR; COLUNA: COMPRADOR)"),
+            startRow = 1, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 11, textDecoration = "bold"), rows = 1, cols = 1)
+  vCod <- lCodigoSetores[vIdxTec]
+  writeData(wb, sAba, t(c("Código", "Setor", vCod)), startRow = 3, startCol = 1, colNames = FALSE)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, halign = "center", valign = "center",
+                                 border = "TopBottomLeftRight", borderStyle = "thin", textDecoration = "bold"),
+           rows = 3, cols = 1:(2 + length(vCod)), gridExpand = TRUE)
+  mSub <- mCampoInfluencia[vIdxTec, vIdxTec]
+  writeData(wb, sAba, data.frame(vCod, lNomes[vIdxTec], mSub, check.names = FALSE),
+            startRow = 4, startCol = 1, colNames = FALSE)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9), rows = 4:(3 + length(vCod)),
+           cols = 1:2, gridExpand = TRUE)
+  vCores <- c("#FFFFFF", "#D0E1F9", "#FFE79A", "#FFB07C")
+  mCatSub <- mCategoria[vIdxTec, vIdxTec]
+  for (k in 0:3) {
+    vPos <- which(mCatSub == k, arr.ind = TRUE)
+    if (nrow(vPos) > 0) {
+      for (p in seq_len(nrow(vPos))) {
+        addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8, numFmt = "0.00",
+                                       fgFill = vCores[k + 1], halign = "center",
+                                       border = "TopBottomLeftRight", borderColour = "#BFBFBF"),
+                 rows = 3 + vPos[p, 1], cols = 2 + vPos[p, 2])
+      }
+    }
+  }
+  nFim <- 3 + length(vCod)
+  writeData(wb, sAba, c(sFonteNota,
+                        "Legenda das cores (valores de S_ij em relação à matriz 68 x 68): branco < média; azul entre a média e a média + 1 DP; amarelo entre média + 1 DP e média + 2 DP; laranja > média + 2 DP.",
+                        "Nota: setores ordenados pelo índice de esforço tecnológico; os códigos das colunas seguem a mesma ordem das linhas."),
+            startRow = nFim + 2, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8), rows = (nFim + 2):(nFim + 4), cols = 1)
+  setColWidths(wb, sAba, cols = 1, widths = 7)
+  setColWidths(wb, sAba, cols = 2, widths = 48)
+  setColWidths(wb, sAba, cols = 3:(2 + length(vCod)), widths = 6.5)
+  freezePane(wb, sAba, firstActiveRow = 4, firstActiveCol = 3)
+
+  # 5.6 (opcional) indicadores dos 68 setores
+  if (bIncluir68) {
+    dTab <- dSinteseIP[order(-dSinteseIP$Esforco_tecnologico),
+                       c("Setor", "Esforco_tecnologico", "Ligacao_tras", "Ligacao_frente",
+                         "Classificacao_HR", "PBLN", "PFLN", "PTLN",
+                         "Influencia_vendas", "Influencia_compras", "Intensivo_tecnologia")]
+    fEscreverTabela(wb, "68 setores",
+                    "INDICADORES DE INSUMO-PRODUTO DOS 68 SETORES DE ATIVIDADE (2018)",
+                    dTab,
+                    c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                      "Esforço Tecnológico (IE)", "Ligação para trás (HR)", "Ligação para frente (HR)",
+                      "Classificação (HR)", "PBLN", "PFLN", "PTLN",
+                      "Campo de influência: vendas", "Campo de influência: compras",
+                      "Intensivo em tecnologia (IE > 1)"),
+                    c("@", "0.00", "0.00", "0.00", "@", "0.00", "0.00", "0.00", "0.00", "0.00", "@"),
+                    c(sFonteNota, "Nota: índices normalizados pela média dos 68 setores (valores > 1 em negrito)."),
+                    c(52, 10, 10, 10, 26, 10, 10, 10, 11, 11, 11), vDestaque = c(3, 4, 6, 7, 8, 9, 10))
+  }
+
+  saveWorkbook(wb, file.path("Outputs", sArquivo), overwrite = TRUE)
+}
+
+if (bExportarResultados) {
+  # 25 setores intensivos em tecnologia (IE > 1)
+  fExportarIndicadores(vIdxTec, "DOS SETORES INTENSIVOS EM TECNOLOGIA",
+                       "Nota: setores com índice de esforço tecnológico (IE) > 1, ordenados pelo IE; índices normalizados pela média dos 68 setores (valores > 1 em negrito).",
+                       "05_Indicadores_insumo_produto_2018.xlsx", bIncluir68 = bExportar68Setores)
+  # 43 setores não intensivos em tecnologia (IE <= 1)
+  fExportarIndicadores(vIdxNaoTec, "DOS SETORES NÃO INTENSIVOS EM TECNOLOGIA",
+                       "Nota: setores com índice de esforço tecnológico (IE) <= 1, ordenados pelo IE; índices normalizados pela média dos 68 setores (valores > 1 em negrito).",
+                       "05_Indicadores_insumo_produto_2018_nao_intensivos.xlsx")
+}
+```
+
+## 7.2 Tabelas e figuras dos setores intensivos (HTML, LaTeX, PNG, PDF e Word)
+
+```{r exportar-intensivos}
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  fSalvarKable(kTabelaHR,  file.path("Outputs", "06_Tabela_ligacoes_HR.html"))
+  fSalvarKable(kTabelaGHS, file.path("Outputs", "06_Tabela_indices_puros.html"))
+  # versões em LaTeX (para o Overleaf)
+  fTabelaLatex(dTabelaHR, c("Nº", "Setores", "Índice de Ligação\\\\para Trás", "Índice de Ligação\\\\para Frente"),
+               c("c", "L", "N", "N"),
+               "Índices de Ligação de Hirschman-Rasmussen dos Setores Intensivos em Tecnologia (2018)",
+               sFonteTabela, "tab:hr_intensivos", file.path("Outputs", "06_Tabela_ligacoes_HR.tex"))
+  fTabelaLatex(dTabelaGHS, c("Nº", "Setores", "Índice Puro de Ligação\\\\Normalizado para Trás", "Índice Puro de Ligação\\\\Normalizado para Frente", "Índice Puro Total de\\\\Ligações Normalizado"),
+               c("c", "L", "N", "N", "N"),
+               "Índices Puros de Ligação dos Setores Intensivos em Tecnologia (2018)",
+               sFonteTabela, "tab:ghs_intensivos", file.path("Outputs", "06_Tabela_indices_puros.tex"))
+  if (bExportarWord && bWordDisponivel) {
+    # versões em Word (.docx), Times New Roman 10, para copiar e colar na monografia
+    docTabelas <- read_docx()
+    docTabelas <- fAdicionarTabelaWord(docTabelas,
+                                       fTabelaWord(dTabelaHR, c(0.9, 9.5, 2.8, 2.8)),
+                                       "Índices de Ligação de Hirschman-Rasmussen dos Setores Intensivos em Tecnologia (2018)",
+                                       sFonteTabela)
+    docTabelas <- fAdicionarTabelaWord(docTabelas,
+                                       fTabelaWord(dTabelaGHS, c(0.9, 6.1, 3.0, 3.0, 3.0)),
+                                       "Índices Puros de Ligação dos Setores Intensivos em Tecnologia (2018)",
+                                       sFonteTabela)
+    print(docTabelas, target = file.path("Outputs", "06_Tabelas_setores_intensivos.docx"))
+  }
+  ggsave(file.path("Outputs", "06_Rede_coeficientes.png"), gRedeCoef,
+         width = 13, height = 6.8, dpi = 300, bg = "white")
+  ggsave(file.path("Outputs", "06_Rede_coeficientes.pdf"), gRedeCoef,
+         width = 13, height = 6.8, device = cairo_pdf)
+  ggsave(file.path("Outputs", "06_Rede_coeficientes_economia.png"), gRedeCoefEconomia,
+         width = 14, height = 8, dpi = 300, bg = "white")
+  ggsave(file.path("Outputs", "06_Rede_coeficientes_economia.pdf"), gRedeCoefEconomia,
+         width = 14, height = 8, device = cairo_pdf)
+  suppressWarnings({
+    ggsave(file.path("Outputs", "06_Campo_influencia_mapa_calor.png"), gCampoCalor,
+           width = 12.5, height = 10, dpi = 300)
+    ggsave(file.path("Outputs", "06_Campo_influencia_mapa_calor.pdf"), gCampoCalor,
+           width = 12.5, height = 10, device = cairo_pdf)
+  })
+
+  # Figuras em Word (.docx) no padrão ABNT: título acima, fonte e nota abaixo
+  if (bExportarWord && bOfficerDisponivel) {
+    sFonteFigura <- "elaboração própria com dados da MIP 2018 (NEREUS/USP)."
+    sDirFig <- file.path("Outputs", "figuras_docx")
+    dir.create(sDirFig, showWarnings = FALSE)
+    # imagens sem título e notas internas, com textos ampliados
+    suppressWarnings({
+      ggsave(file.path(sDirFig, "fig_mapa_calor.png"),
+             fVersaoDocumento(gCampoCalor, nTamanhoLegenda = 9) +
+               theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6.5,
+                                                colour = vCorEixo, face = vFaceEixo),
+                     axis.text.y = element_text(size = 6.5, colour = vCorEixo, face = vFaceEixo),
+                     plot.background = element_rect(fill = "white", colour = NA)),
+             width = 10.5, height = 8, dpi = 300, bg = "white")
+    })
+    ggsave(file.path(sDirFig, "fig_rede_25.png"), fVersaoDocumento(gRedeCoef) +
+             guides(fill = guide_legend(nrow = 2, order = 1,
+                                        override.aes = list(size = 4.5, shape = 22, colour = NA))),
+           width = 10, height = 6.4, dpi = 300, bg = "white")
+    ggsave(file.path(sDirFig, "fig_rede_economia.png"), fVersaoDocumento(gRedeCoefEconomia),
+           width = 10, height = 7.2, dpi = 300, bg = "white")
+
+    docFiguras <- read_docx()
+    docFiguras <- body_set_default_section(docFiguras, prop_section(
+      page_size = page_size(width = 21 / 2.54, height = 29.7 / 2.54, orient = "portrait"),
+      page_margins = page_mar(top = 3 / 2.54, bottom = 2 / 2.54, left = 3 / 2.54, right = 2 / 2.54)))
+    docFiguras <- fAdicionarFiguraWord(docFiguras, file.path(sDirFig, "fig_mapa_calor.png"),
+      "Campo de influência dos coeficientes técnicos da economia brasileira, com destaque para os setores intensivos em tecnologia (2018)",
+      sFonteFigura,
+      paste0("cada célula corresponde a um coeficiente técnico a_ij (eixo horizontal: setor vendedor i; eixo vertical: setor comprador j), ",
+             "classificado segundo a média e o desvio-padrão (DP) da matriz de campo de influência 68 x 68. ",
+             "Setores 1 a ", nTec, " (em azul): intensivos em tecnologia, na numeração das tabelas dos setores intensivos; ",
+             "setores ", nTec + 1, " a ", nTodos, ": não intensivos, na numeração das tabelas dos setores não intensivos acrescida de ", nTec, "."),
+      nAlturaCm = 16 * 8 / 10.5)
+    docFiguras <- body_add_break(docFiguras)
+    docFiguras <- fAdicionarFiguraWord(docFiguras, file.path(sDirFig, "fig_rede_25.png"),
+      "Rede de coeficientes técnicos entre os setores intensivos em tecnologia (2018)",
+      sFonteFigura,
+      paste0("tamanho do círculo: ", sNotaTamanho, "; numeração dos setores em ordem decrescente de esforço tecnológico, como nas tabelas; ",
+             "linhas: pares de setores com coeficiente técnico a_ij ou a_ji maior ou igual a ", format(nLimiteCoef, decimal.mark = ","),
+             " (cinza-escuro: maior ou igual a ", format(nLimiteForte, decimal.mark = ","), "), isto é, compras de pelo menos R$ ",
+             format(nLimiteCoef, decimal.mark = ","), " por real produzido."),
+      nAlturaCm = 16 * 6.4 / 10)
+    docFiguras <- body_add_break(docFiguras)
+    docFiguras <- fAdicionarFiguraWord(docFiguras, file.path(sDirFig, "fig_rede_economia.png"),
+      "Rede de coeficientes técnicos dos setores intensivos em tecnologia com o restante da economia (2018)",
+      sFonteFigura,
+      paste0("tamanho do círculo dos setores intensivos: ", sNotaTamanho, "; numeração em ordem decrescente de esforço tecnológico, como nas tabelas; ",
+             "setores não intensivos em cinza (numerados os 10 com mais ligações com setores intensivos, na numeração do mapa de calor); ",
+             "linhas: pares com coeficiente técnico a_ij ou a_ji maior ou igual a ", format(nLimiteCoef, decimal.mark = ","),
+             " com pelo menos um setor intensivo (cinza-escuro: maior ou igual a ", format(nLimiteForte, decimal.mark = ","), ")."),
+      nAlturaCm = 16 * 7.2 / 10)
+    print(docFiguras, target = file.path("Outputs", "06_Figuras_ABNT.docx"))
+  }
+}
+```
+
+## 7.3 Tabelas dos setores não intensivos (HTML, LaTeX e Word)
+
+```{r exportar-nao-intensivos}
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  fSalvarKable(kTabelaHR_NaoTec,  file.path("Outputs", "07_Tabela_ligacoes_HR_nao_intensivos.html"))
+  fSalvarKable(kTabelaGHS_NaoTec, file.path("Outputs", "07_Tabela_indices_puros_nao_intensivos.html"))
+  # versões em LaTeX (para o Overleaf)
+  fTabelaLatex(dTabelaHR_NaoTec, c("Nº", "Setores", "Índice de Ligação\\\\para Trás", "Índice de Ligação\\\\para Frente"),
+               c("c", "L", "N", "N"),
+               "Índices de Ligação de Hirschman-Rasmussen dos Setores Não Intensivos em Tecnologia (2018)",
+               sFonteNaoTec, "tab:hr_nao_intensivos", file.path("Outputs", "07_Tabela_ligacoes_HR_nao_intensivos.tex"))
+  fTabelaLatex(dTabelaGHS_NaoTec, c("Nº", "Setores", "Índice Puro de Ligação\\\\Normalizado para Trás", "Índice Puro de Ligação\\\\Normalizado para Frente", "Índice Puro Total de\\\\Ligações Normalizado"),
+               c("c", "L", "N", "N", "N"),
+               "Índices Puros de Ligação dos Setores Não Intensivos em Tecnologia (2018)",
+               sFonteNaoTec, "tab:ghs_nao_intensivos", file.path("Outputs", "07_Tabela_indices_puros_nao_intensivos.tex"))
+  if (bExportarWord && bWordDisponivel) {
+    # versões em Word (.docx), Times New Roman 10, para copiar e colar na monografia
+    docTabelas <- read_docx()
+    docTabelas <- fAdicionarTabelaWord(docTabelas,
+                                       fTabelaWord(dTabelaHR_NaoTec, c(0.9, 9.5, 2.8, 2.8)),
+                                       "Índices de Ligação de Hirschman-Rasmussen dos Setores Não Intensivos em Tecnologia (2018)",
+                                       sFonteNaoTec)
+    docTabelas <- fAdicionarTabelaWord(docTabelas,
+                                       fTabelaWord(dTabelaGHS_NaoTec, c(0.9, 6.1, 3.0, 3.0, 3.0)),
+                                       "Índices Puros de Ligação dos Setores Não Intensivos em Tecnologia (2018)",
+                                       sFonteNaoTec)
+    print(docTabelas, target = file.path("Outputs", "07_Tabelas_setores_nao_intensivos.docx"))
+  }
+  cat("Tabelas dos setores NÃO intensivos em tecnologia salvas em ./Outputs\n")
+}
+```
+

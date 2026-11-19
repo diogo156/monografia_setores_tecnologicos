@@ -1,0 +1,1624 @@
+---
+title: "Monografia"
+author: "Diogo Nogueira"
+date: "2026-10-19"
+output: html_document
+---
+
+Esse documento consta o código utilizado para realizar as manipulações necessárias para obter os coeficientes tecnológicos com base na metodologia do Morceiro (2018). Nesse sentido, dividiu, o respectivo texto, em 4 sessões sendo elas: " Ajustes Iniciais", "P&D direta", "P&D indireta - insumos" e "P&D indireta - componentes de investimento"
+
+# Indicadores de P&D para 68 setores de atividade (2018)
+##Ajustes Iniciais
+
+```{r setup, include=FALSE}
+
+library(httr)
+library(openxlsx)
+library(fs)
+library(htmltools)
+library(htmlTable)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+
+# =========== Área de Funções =====================
+
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Importe para o Environment os objetos:", paste(lFaltando, collapse = ", ")))
+  }
+}
+ 
+# Converte um bloco de células (texto ou número) em matriz numérica.
+# Células vazias viram zero. Os valores da MIP vêm como texto
+# (ex.: "2.0526630850285367E-2"), e as.numeric converte sem perda de precisão.
+fMatrizNumerica <- function(dBloco) {
+  mBloco <- as.matrix(as.data.frame(dBloco))
+  mBloco <- suppressWarnings(matrix(as.numeric(mBloco),
+                                    nrow = nrow(mBloco), ncol = ncol(mBloco)))
+  mBloco[is.na(mBloco)] <- 0
+  return(mBloco)
+}
+ 
+# Primeira linha cujo valor na coluna 1 é o código informado
+fLinhaCodigo <- function(dSheet, sCodigo) {
+  vColuna1 <- trimws(as.character(dSheet[[1]]))
+  nLinha <- which(vColuna1 == sCodigo)[1]
+  if (is.na(nLinha)) stop(paste("Código não encontrado na coluna 1:", sCodigo))
+  return(nLinha)
+}
+ 
+# Primeira coluna cujo cabeçalho começa com o código informado.
+# Procura nos nomes das colunas e nas linhas acima do início dos dados,
+# para funcionar com ou sem "First Row as Names".
+# O padrão aceita "0191" e "0191\nAgricultura..." (formato do IBGE).
+# Retorna a coluna e os códigos de todo o cabeçalho (linha onde o código foi achado).
+fColunaCodigo <- function(dSheet, sCodigo, nLinhaLimite) {
+  sPadrao <- paste0("^", sCodigo, "(\\s|$)")
+  vNomes <- trimws(names(dSheet))
+  if (any(grepl(sPadrao, vNomes))) {
+    return(list(nColuna = which(grepl(sPadrao, vNomes))[1],
+                vCabecalho = sub("\\s.*$", "", vNomes)))
+  }
+  for (nLinha in seq_len(nLinhaLimite)) {
+    vLinha <- trimws(as.character(unlist(dSheet[nLinha, ])))
+    nColuna <- which(grepl(sPadrao, vLinha))
+    if (length(nColuna) > 0) {
+      return(list(nColuna = nColuna[1], vCabecalho = sub("\\s.*$", "", vLinha)))
+    }
+  }
+  stop(paste("Código não encontrado no cabeçalho:", sCodigo))
+}
+ 
+# Primeira coluna cujo cabeçalho começa com um texto (espaços e quebras de
+# linha são normalizados)
+fColunaTexto <- function(dSheet, sTexto, nLinhaLimite) {
+  fNormalizar <- function(v) trimws(gsub("\\s+", " ", as.character(v)))
+  if (any(startsWith(fNormalizar(names(dSheet)), sTexto))) {
+    return(which(startsWith(fNormalizar(names(dSheet)), sTexto))[1])
+  }
+  for (nLinha in seq_len(nLinhaLimite)) {
+    vLinha <- fNormalizar(unlist(dSheet[nLinha, ]))
+    nColuna <- which(startsWith(vLinha, sTexto))
+    if (length(nColuna) > 0) return(nColuna[1])
+  }
+  stop(paste("Texto não encontrado no cabeçalho:", sTexto))
+}
+ 
+# Extrai um bloco numérico a partir dos códigos da primeira linha e da
+# primeira coluna. Retorna também os códigos das linhas e das colunas do bloco.
+fBloco <- function(dSheet, sCodigoLinha, sCodigoColuna, nLinhas, nColunas) {
+  nLinha <- fLinhaCodigo(dSheet, sCodigoLinha)
+  lColuna <- fColunaCodigo(dSheet, sCodigoColuna, nLinha - 1)
+  vLinhas  <- nLinha:(nLinha + nLinhas - 1)
+  vColunas <- lColuna$nColuna:(lColuna$nColuna + nColunas - 1)
+  return(list(mBloco = fMatrizNumerica(dSheet[vLinhas, vColunas]),
+              nLinha = nLinha, nColuna = lColuna$nColuna,
+              lCodigoLinhas  = trimws(as.character(dSheet[[1]][vLinhas])),
+              lNomeLinhas    = trimws(as.character(dSheet[[2]][vLinhas])),
+              lCodigoColunas = lColuna$vCabecalho[vColunas]))
+}
+ 
+# Linha do rodapé da MIP pelo rótulo da coluna 2. A busca é pelo início do
+# texto, sem acentos, para não depender da codificação de caracteres do
+# computador (Windows x Linux).
+fLinhaRotulo <- function(dSheet, sRotulo, nColuna, nColunas) {
+  vRotulos <- trimws(as.character(dSheet[[2]]))
+  nLinha <- which(startsWith(vRotulos, sRotulo))
+  if (length(nLinha) != 1) stop(paste("Rótulo não encontrado ou repetido:", sRotulo))
+  return(fMatrizNumerica(dSheet[nLinha, nColuna:(nColuna + nColunas - 1)])[1, ])
+}
+ 
+# Registra o resultado de uma conferência (diferença máxima absoluta)
+fConferencia <- function(sDescricao, nDiferenca, nTolerancia = 1e-6) {
+  data.frame(Conferencia = sDescricao,
+             Diferenca_maxima = as.numeric(nDiferenca),
+             Resultado = ifelse(abs(nDiferenca) <= nTolerancia, "OK", "VERIFICAR"))
+}
+# =========== Área do código principal ============
+
+# Parâmetros
+#
+nSetores  = 68
+nProdutos = 128
+sCodigoPeD = "71801"    # produto "Pesquisa e desenvolvimento" no SCN Ref. 2010
+sPrimeiroSetor = "0191"  # Agricultura (código da atividade)
+sPrimeiroProduto = "01911"  # Arroz, trigo e outros cereais (código do produto)
+bExportarResultados = TRUE  # TRUE salva as conferências em ./Outputs
+ 
+fVerificarObjetos(c("dUsosSxS", "dUsosPxS", "dProducao", "dImportacoes",
+                    "dMatA", "dLeontief", "dTRUProducao", "dTRUOferta"))
+
+
+# 1. MIP 2018 - NEREUS
+#################################################################################
+# Matriz de consumo intermediário doméstico setor x setor (Z).
+# Na aba Usos SxS as linhas começam com o código "01911" e as colunas com "0191".
+lZ <- fBloco(dUsosSxS, sPrimeiroProduto, sPrimeiroSetor, nSetores, nSetores)
+mZ <- lZ$mBloco
+nColunaSetoresSxS <- lZ$nColuna
+ 
+lCodigoSetores <- lZ$lCodigoColunas
+lNomeSetores   <- lZ$lNomeLinhas
+ 
+# Rodapé da aba Usos SxS
+vProdNac   <- fLinhaRotulo(dUsosSxS, "Prod Nac", nColunaSetoresSxS, nSetores)
+vImportado <- fLinhaRotulo(dUsosSxS, "Importado", nColunaSetoresSxS, nSetores)
+vImpostos  <- fLinhaRotulo(dUsosSxS, "Imp Import", nColunaSetoresSxS, nSetores) +
+              fLinhaRotulo(dUsosSxS, "ICMS Total", nColunaSetoresSxS, nSetores) +
+              fLinhaRotulo(dUsosSxS, "IPI Total", nColunaSetoresSxS, nSetores) +
+              fLinhaRotulo(dUsosSxS, "Outros IIL Total", nColunaSetoresSxS, nSetores)
+vCI        <- fLinhaRotulo(dUsosSxS, "CONSUMO INTERMEDI", nColunaSetoresSxS, nSetores)
+vVA        <- fLinhaRotulo(dUsosSxS, "Valor adicionado bruto", nColunaSetoresSxS, nSetores)
+vX         <- fLinhaRotulo(dUsosSxS, "VALOR DA PRODU", nColunaSetoresSxS, nSetores)
+ 
+# Demanda total por setor (coluna "Demanda total")
+nColunaDemandaTotal <- fColunaTexto(dUsosSxS, "Demanda total", lZ$nLinha - 1)
+vDemandaTotal <- fMatrizNumerica(dUsosSxS[lZ$nLinha + 0:(nSetores - 1), nColunaDemandaTotal])[, 1]
+ 
+# Coeficientes técnicos e inversa de Leontief publicados pelo NEREUS
+mA_NEREUS        <- fBloco(dMatA, sPrimeiroProduto, sPrimeiroSetor, nSetores, nSetores)$mBloco
+mLeontief_NEREUS <- fBloco(dLeontief, sPrimeiroProduto, sPrimeiroSetor, nSetores, nSetores)$mBloco
+ 
+# Matriz de produção (V): setor x produto. Linhas começam com "0191";
+# colunas com o código de produto "01911".
+lV <- fBloco(dProducao, sPrimeiroSetor, sPrimeiroProduto, nSetores, nProdutos)
+mV_MIP <- lV$mBloco
+lCodigoProdutosProducao <- lV$lCodigoColunas
+stopifnot(all(lV$lCodigoLinhas == lCodigoSetores))   # setores na mesma ordem
+ vOcupacoes <- fLinhaRotulo(dUsosSxS, "Fator trabalho", nColunaSetoresSxS, nSetores)  # pessoas ocupadas
+# Usos de produtos nacionais e importados (produto x setor)
+lUNac <- fBloco(dUsosPxS, sPrimeiroProduto, sPrimeiroSetor, nProdutos, nSetores)
+mU_Nac <- lUNac$mBloco
+lCodigoProdutos <- lUNac$lCodigoLinhas
+lNomeProdutos   <- lUNac$lNomeLinhas
+ 
+lUImp <- fBloco(dImportacoes, sPrimeiroProduto, sPrimeiroSetor, nProdutos, nSetores)
+mU_Imp <- lUImp$mBloco
+lCodigoProdutosImport <- lUImp$lCodigoLinhas
+ 
+#################################################################################
+# 2. TRU 2018 - IBGE, Tabela 1 (Recursos, valores correntes)
+#################################################################################
+# Atenção: as Tabelas 3 e 4 do IBGE estão a preços do ano anterior e
+# NÃO são usadas neste trabalho.
+# Matriz de produção da TRU: produto x atividade, transposta para setor x produto
+lVTRU <- fBloco(dTRUProducao, sPrimeiroProduto, sPrimeiroSetor, nProdutos, nSetores)
+mV_TRU <- t(lVTRU$mBloco)
+lCodigoProdutosTRU <- lVTRU$lCodigoLinhas
+stopifnot(all(lVTRU$lCodigoColunas == lCodigoSetores))   # atividades na mesma ordem
+ 
+# Oferta do produto P&D: preço de consumidor, margens, impostos e preço básico
+nLinhaPeD_TRU <- fLinhaCodigo(dTRUOferta, sCodigoPeD)
+nColunaOferta <- fColunaTexto(dTRUOferta, "Oferta total", nLinhaPeD_TRU - 1)
+vOfertaPeD <- fMatrizNumerica(dTRUOferta[nLinhaPeD_TRU, nColunaOferta + 0:8])[1, ]
+names(vOfertaPeD) <- c("Oferta_consumidor", "Margem_comercio", "Margem_transporte",
+                       "Imposto_importacao", "IPI", "ICMS", "Outros_impostos",
+                       "Total_impostos", "Oferta_basico")
+ 
+#################################################################################
+# 3. Conferências
+#################################################################################
+lConferencias <- list()
+ 
+# 3.1 Ordem de setores e produtos igual entre as abas e entre MIP e TRU
+lConferencias[[1]] <- fConferencia("Ordem dos produtos: Usos PxS = Importacoes",
+                                   sum(lCodigoProdutos != lCodigoProdutosImport))
+lConferencias[[2]] <- fConferencia("Ordem dos produtos: Usos PxS = Producao",
+                                   sum(lCodigoProdutos != lCodigoProdutosProducao))
+lConferencias[[3]] <- fConferencia("Ordem dos produtos: MIP = TRU Tabela 1",
+                                   sum(lCodigoProdutos != lCodigoProdutosTRU))
+ 
+# 3.2 Fechamento da MIP
+lConferencias[[4]] <- fConferencia("Prod Nac = soma das colunas de Z",
+                                   max(abs(colSums(mZ) - vProdNac)))
+lConferencias[[5]] <- fConferencia("CI = Prod Nac + Importado + impostos",
+                                   max(abs(vProdNac + vImportado + vImpostos - vCI)))
+lConferencias[[6]] <- fConferencia("Valor da produção = CI + VA",
+                                   max(abs(vCI + vVA - vX)))
+lConferencias[[7]] <- fConferencia("Demanda total (linha) = valor da produção",
+                                   max(abs(vDemandaTotal - vX)), nTolerancia = 1)
+ 
+# 3.3 A e Leontief publicados = calculados a partir da matriz doméstica
+mA <- t(t(mZ) / vX)
+mI <- diag(nSetores)
+mLeontief <- solve(mI - mA)
+lConferencias[[8]] <- fConferencia("Mat A publicada = Z / X (doméstica)",
+                                   max(abs(mA - mA_NEREUS)))
+lConferencias[[9]] <- fConferencia("Inv Leontief publicada = (I - A)^-1",
+                                   max(abs(mLeontief - mLeontief_NEREUS)))
+ 
+# 3.4 Importações e produção
+lConferencias[[10]] <- fConferencia("Importacoes: soma das colunas = linha Importado",
+                                    max(abs(colSums(mU_Imp) - vImportado)))
+lConferencias[[11]] <- fConferencia("Producao: soma das linhas = valor da produção",
+                                    max(abs(rowSums(mV_MIP) - vX)))
+ 
+# 3.5 MIP x TRU: matriz de produção célula a célula (valores inteiros na TRU)
+lConferencias[[12]] <- fConferencia("Matriz de produção MIP = TRU (68 x 128)",
+                                    max(abs(mV_MIP - mV_TRU)), nTolerancia = 0.5)
+nColunaPeD <- which(lCodigoProdutos == sCodigoPeD)
+lConferencias[[13]] <- fConferencia("Produção de P&D por setor MIP = TRU",
+                                    max(abs(mV_MIP[, nColunaPeD] - mV_TRU[, nColunaPeD])),
+                                    nTolerancia = 0.5)
+lConferencias[[14]] <- fConferencia("Produção total de P&D = oferta a preço básico (TRU)",
+                                    sum(mV_TRU[, nColunaPeD]) - vOfertaPeD["Oferta_basico"],
+                                    nTolerancia = 0.5)
+ 
+dConferencias <- bind_rows(lConferencias)
+rownames(dConferencias) <- NULL
+print(dConferencias)
+ 
+if (any(dConferencias$Resultado != "OK")) {
+  warning("Há conferências com resultado VERIFICAR. Revise a importação das bases.")
+}
+ 
+# Resumo do produto P&D
+cat("\nProduto P&D (", sCodigoPeD, "):\n")
+cat("  Produção (P&D interna) total ........:", round(sum(mV_MIP[, nColunaPeD]), 1), "\n")
+cat("  Consumo intermediário nacional (MIP) :", round(sum(mU_Nac[nColunaPeD, ]), 1), "\n")
+cat("  Consumo intermediário importado (MIP):", round(sum(mU_Imp[nColunaPeD, ]), 1), "\n")
+print(vOfertaPeD)
+ 
+#################################################################################
+# 4. Exportação (opcional)
+#################################################################################
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  write.xlsx(dConferencias, file.path("Outputs", "01_conferencias.xlsx"), overwrite = TRUE)
+}
+
+```
+
+
+##PeD direta 2018 
+ 
+```{r}
+# =========== Área de Funções =====================
+
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Objetos ausentes no Environment:", paste(lFaltando, collapse = ", ")))
+  }
+}
+
+# Garante códigos SCN com zeros à esquerda (ex.: 191 -> "0191"), caso a
+# importação tenha lido o código como número
+fCodigo <- function(v) {
+  v <- trimws(as.character(v))
+  ifelse(grepl("^[0-9]+$", v) & nchar(v) < 4, formatC(as.numeric(v), width = 4, flag = "0"), v)
+}
+
+# Realoca a P&D direta de 2018 com as proporções de Morceiro para 2013.
+#   vPeD          : P&D direta de 2018 sem realocação (68 setores)
+#   dRealocacao   : tabela de institutos, valores de 2013 e destinos
+#   dReferencia   : Apêndice H (P&D de 2013 depois da realocação)
+# Para cada setor de origem o (8400 ou 7180):
+#   P&D_o,2013 antes da realocação = P&D_o,2013 (Apêndice H) + total realocado_o
+#   proporção realocada s_o        = total realocado_o / P&D_o,2013 antes
+#   valor realocado em 2018        = s_o * P&D_o,2018
+#   destino d recebe               = valor realocado em 2018 * peso_d
+#   peso_d = (valor de 2013 que foi para d) / total realocado_o
+fRealocarPeD <- function(vPeD, dRealocacao, dReferencia, lCodigoSetores) {
+  vPeDRealocada <- vPeD
+  dParametros <- data.frame()
+
+  for (sOrigem in unique(dRealocacao$origem)) {
+    dOrigem <- dRealocacao[dRealocacao$origem == sOrigem, ]
+
+    # Valor de 2013 que vai para cada destino (participações normalizadas por
+    # instituição, pois algumas somam 99,9% na tese por arredondamento)
+    dOrigem <- dOrigem %>%
+      group_by(instituicao) %>%
+      mutate(peso_inst = participacao_destino_pct / sum(participacao_destino_pct)) %>%
+      ungroup() %>%
+      mutate(valor_destino = valor_instituicao_R2017 * peso_inst)
+
+    nTotalRealocado2013 <- sum(dOrigem$valor_destino)
+    nPeDOrigem2013Depois <- dReferencia$H_PeD_milhoes_R2017[dReferencia$codigo == sOrigem]
+    nPeDOrigem2013Antes  <- nPeDOrigem2013Depois + nTotalRealocado2013
+    nProporcao <- nTotalRealocado2013 / nPeDOrigem2013Antes
+
+    nOrigem <- which(lCodigoSetores == sOrigem)
+    nValor2018 <- nProporcao * vPeD[nOrigem]
+
+    dDestinos <- dOrigem %>%
+      group_by(destino) %>%
+      summarise(valor_2013 = sum(valor_destino), .groups = "drop") %>%
+      mutate(peso = valor_2013 / nTotalRealocado2013,
+             valor_2018 = nValor2018 * peso)
+
+    vPeDRealocada[nOrigem] <- vPeDRealocada[nOrigem] - nValor2018
+    for (k in seq_len(nrow(dDestinos))) {
+      nDestino <- which(lCodigoSetores == dDestinos$destino[k])
+      vPeDRealocada[nDestino] <- vPeDRealocada[nDestino] + dDestinos$valor_2018[k]
+    }
+
+    dParametros <- bind_rows(dParametros, data.frame(
+      origem = sOrigem, destino = dDestinos$destino,
+      PeD_origem_2013_antes = nPeDOrigem2013Antes,
+      total_realocado_2013 = nTotalRealocado2013,
+      proporcao_realocada = nProporcao,
+      peso_destino = dDestinos$peso,
+      PeD_origem_2018 = vPeD[nOrigem],
+      valor_realocado_2018 = dDestinos$valor_2018))
+  }
+
+  # Conferência: a realocação não cria nem destrói P&D
+  stopifnot(abs(sum(vPeDRealocada) - sum(vPeD)) < 1e-6)
+  stopifnot(all(vPeDRealocada >= 0))
+
+  return(list(vPeD = vPeDRealocada, dParametros = dParametros))
+}
+
+# Monta a tabela de resultados de um cenário
+fTabelaPeDDireta <- function(vPeDDireta, vX, nRMedia) {
+  data.frame(PeD_direta = vPeDDireta,
+             Participacao_pct = 100 * vPeDDireta / sum(vPeDDireta),
+             r_direta_pct = 100 * vPeDDireta / vX,
+             Indice_direta = (vPeDDireta / vX) / nRMedia)
+}
+
+
+# ---------------------------------------------------------------------------------
+# Funções da tabela de saída no formato do Apêndice H de Morceiro (2018)
+# ---------------------------------------------------------------------------------
+
+# Estrutura de grupos do Apêndice H de Morceiro (2018). A indústria de maior
+# intensidade tecnológica segue a classificação do autor: químicos,
+# farmacêuticos, informática e eletrônicos, máquinas elétricas e mecânicas,
+# veículos, peças e outros equipamentos de transporte.
+fEstruturaApendiceH <- function() {
+  list(
+    list(nome = "Agropecuária", codigos = c("0191", "0192", "0280")),
+    list(nome = "Indústria Extrativa", codigos = c("0580", "0680", "0791", "0792")),
+    list(nome = "Indústria de transformação", subgrupos = list(
+      list(nome = "Indústria de menor intensidade tecnológica",
+           codigos = c("1091", "1092", "1093", "1100", "1200", "1300", "1400", "1500",
+                       "1600", "1700", "1800", "1991", "1992", "2200", "2300", "2491",
+                       "2492", "2500", "3180", "3300")),
+      list(nome = "Indústria de maior intensidade tecnológica",
+           codigos = c("2091", "2092", "2093", "2100", "2600", "2700", "2800",
+                       "2991", "2992", "3000")))),
+    list(nome = "Eletricidade e gás, água, esgoto e limpeza urbana", codigos = c("3500", "3680")),
+    list(nome = "Construção", codigos = c("4180")),
+    list(nome = "Serviços", subgrupos = list(
+      list(nome = "Serviços privados",
+           codigos = c("4500", "4680", "4900", "5000", "5100", "5280", "5500", "5600",
+                       "5800", "5980", "6100", "6280", "6480", "6800", "6980", "7180",
+                       "7380", "7700", "7880", "8000", "8592", "8692", "9080", "9480", "9700")),
+      list(nome = "Serviços públicos", codigos = c("8400", "8591", "8691"))))
+  )
+}
+
+# Indicadores de P&D direta de um conjunto de setores (um setor ou um grupo).
+# Agregados: soma para P&D, produção, PIB e pessoal ocupado; a intensidade
+# direta do grupo é a P&D do grupo dividida pela produção do grupo.
+fIndicadoresDireta <- function(vIdx, vPeD, vX, vVA, vOcupacoes) {
+  nPeD <- sum(vPeD[vIdx]); nX <- sum(vX[vIdx]); nVA <- sum(vVA[vIdx])
+  nOcup <- sum(vOcupacoes[vIdx])
+  c(PeD_milhoes        = nPeD,
+    PeD_por_ocupado_R  = ifelse(nOcup > 0, nPeD * 1e6 / nOcup, NA),
+    PeD_pct_total      = 100 * nPeD / sum(vPeD),
+    Producao_pct_total = 100 * nX / sum(vX),
+    PIB_pct_total      = 100 * nVA / sum(vVA),
+    PeD_PIB_pct        = ifelse(nVA != 0, 100 * nPeD / nVA, NA),
+    Direta_pct         = 100 * nPeD / nX)
+}
+
+# Monta a tabela no formato do Apêndice H. Dentro de cada grupo, os setores são
+# ordenados pela P&D (maior para menor), como em Morceiro (2018).
+fTabelaApendiceH <- function(vPeD, vX, vVA, vOcupacoes, lNomes, lCodigoSetores) {
+  lEstrutura <- fEstruturaApendiceH()
+  lLinhas <- list()
+  fAdicionar <- function(sNome, nNivel, bGrupo, vIdx) {
+    lLinhas[[length(lLinhas) + 1]] <<- data.frame(
+      Setor = sNome, Nivel = nNivel, Grupo = bGrupo,
+      t(fIndicadoresDireta(vIdx, vPeD, vX, vVA, vOcupacoes)), check.names = FALSE)
+  }
+  fCodigosGrupo <- function(lGrupo) {
+    if (!is.null(lGrupo$codigos)) return(lGrupo$codigos)
+    unlist(lapply(lGrupo$subgrupos, fCodigosGrupo))
+  }
+  fPercorrer <- function(lGrupo, nNivel) {
+    vIdx <- match(fCodigosGrupo(lGrupo), lCodigoSetores)
+    fAdicionar(lGrupo$nome, nNivel, TRUE, vIdx)
+    if (!is.null(lGrupo$subgrupos)) {
+      for (lSub in lGrupo$subgrupos) fPercorrer(lSub, nNivel + 1)
+    } else if (length(vIdx) > 1) {
+      for (k in vIdx[order(-vPeD[vIdx], vIdx)]) fAdicionar(lNomes[k], nNivel + 1, FALSE, k)
+    }
+  }
+  vTodos <- unlist(lapply(lEstrutura, fCodigosGrupo))
+  stopifnot(length(vTodos) == length(lCodigoSetores), all(sort(vTodos) == sort(lCodigoSetores)))
+  for (lGrupo in lEstrutura) fPercorrer(lGrupo, 0)
+  fAdicionar("TOTAL", 0, TRUE, seq_along(lCodigoSetores))
+  dTabela <- bind_rows(lLinhas)
+  rownames(dTabela) <- NULL
+  return(dTabela)
+}
+
+# Escreve a tabela em uma aba do Excel com a formatação do Apêndice H
+fEscreverApendiceH <- function(wb, sAba, sTitulo, dTabela, vNotas) {
+  addWorksheet(wb, sAba, gridLines = FALSE)
+  sFonte <- "Times New Roman"
+  stCab <- createStyle(fontName = sFonte, fontSize = 9, halign = "center", valign = "center",
+                       wrapText = TRUE, border = "TopBottomLeftRight", borderStyle = "thin")
+
+  writeData(wb, sAba, sTitulo, startRow = 1, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 11, textDecoration = "bold"),
+           rows = 1, cols = 1)
+
+  # Cabeçalho em três linhas (3 a 5), como no Apêndice H
+  writeData(wb, sAba, t(c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                          "P&D (em 10^6)", "P&D / Pessoal ocupado", "P&D", "Produção", "PIB",
+                          "P&D / PIB (em %)")),
+            startRow = 3, startCol = 1, colNames = FALSE)
+  writeData(wb, sAba, "P&D sobre a Produção (em %)", startRow = 3, startCol = 8)
+  writeData(wb, sAba, "Direta (próprio setor)", startRow = 4, startCol = 8)
+  writeData(wb, sAba, "Em R$ milhões correntes / Em R$", startRow = 5, startCol = 2)
+  writeData(wb, sAba, "Em % do total", startRow = 5, startCol = 4)
+  mergeCells(wb, sAba, cols = 1, rows = 3:5)
+  for (j in 2:6) mergeCells(wb, sAba, cols = j, rows = 3:4)
+  mergeCells(wb, sAba, cols = 7, rows = 3:5)
+  mergeCells(wb, sAba, cols = 8, rows = 4:5)
+  mergeCells(wb, sAba, cols = 2:3, rows = 5)
+  mergeCells(wb, sAba, cols = 4:6, rows = 5)
+  addStyle(wb, sAba, stCab, rows = 3:5, cols = 1:8, gridExpand = TRUE)
+
+  # Dados
+  nInicio <- 6
+  vColunas <- c("Setor", "PeD_milhoes", "PeD_por_ocupado_R", "PeD_pct_total",
+                "Producao_pct_total", "PIB_pct_total", "PeD_PIB_pct", "Direta_pct")
+  writeData(wb, sAba, dTabela[, vColunas], startRow = nInicio, startCol = 1,
+            colNames = FALSE, keepNA = FALSE)
+  vFormatos <- c("#,##0.0", "#,##0", rep("0.00", 5))
+  for (i in seq_len(nrow(dTabela))) {
+    nLinha <- nInicio + i - 1
+    bGrupo <- dTabela$Grupo[i]
+    sNegrito <- if (bGrupo) "bold" else NULL
+    sBorda <- if (bGrupo) "top" else NULL
+    addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, textDecoration = sNegrito,
+                                   indent = dTabela$Nivel[i], border = sBorda, borderStyle = "thin"),
+             rows = nLinha, cols = 1)
+    for (j in seq_along(vFormatos)) {
+      sFormato <- if (j == 1 && bGrupo) "#,##0" else vFormatos[j]   # grupos sem decimal, como na tese
+      addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = sFormato,
+                                     halign = "right", textDecoration = sNegrito,
+                                     border = sBorda, borderStyle = "thin"),
+               rows = nLinha, cols = j + 1)
+    }
+  }
+  nFim <- nInicio + nrow(dTabela) - 1
+  addStyle(wb, sAba, createStyle(border = "bottom", borderStyle = "thin"),
+           rows = nFim, cols = 1:8, gridExpand = TRUE, stack = TRUE)
+
+  # Notas e fonte
+  writeData(wb, sAba, vNotas, startRow = nFim + 2, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8),
+           rows = (nFim + 2):(nFim + 1 + length(vNotas)), cols = 1)
+  setColWidths(wb, sAba, cols = 1, widths = 52)
+  setColWidths(wb, sAba, cols = 2:8, widths = 11)
+  setRowHeights(wb, sAba, rows = 4, heights = 30)
+  freezePane(wb, sAba, firstActiveRow = nInicio, firstActiveCol = 2)
+}
+
+# =========== Área do código principal ============
+bExportarResultados = FALSE   # FALSE para não salvar em ./Outputs
+
+# Objetos do Script 01 e bases de referência
+fVerificarObjetos(c("mV_MIP", "mU_Nac", "mU_Imp", "vX", "vVA", "vOcupacoes", "nColunaPeD",
+                    "lCodigoSetores", "lNomeSetores", "nSetores",
+                    "dReferencia", "dRealocacao"))
+
+dReferencia <- as.data.frame(dReferencia)
+dRealocacao <- as.data.frame(dRealocacao)
+dReferencia$codigo  <- fCodigo(dReferencia$codigo)
+dRealocacao$origem  <- fCodigo(dRealocacao$origem)
+dRealocacao$destino <- fCodigo(dRealocacao$destino)
+stopifnot(all(dReferencia$codigo == lCodigoSetores))   # mesma ordem de setores
+stopifnot(all(dRealocacao$destino %in% lCodigoSetores))
+
+sCodigoSetorPeD <- "7180"   # Serviços de arquitetura, engenharia, testes/análises técnicas e P&D
+nSetorPeD <- which(lCodigoSetores == sCodigoSetorPeD)
+
+
+# 1. P&D interna: produção do produto P&D por setor (preços básicos)
+
+vPeDInterna <- mV_MIP[, nColunaPeD]
+
+
+# 2. P&D externa: consumo intermediário de P&D por setor (preços básicos)
+
+# Uso de P&D nacional (aba Usos PxS) + uso de P&D importado (aba Importacoes).
+# Os usos da MIP do NEREUS já estão a preços básicos, o que equivale ao ajuste
+# de preços de consumidor para preços básicos feito por Morceiro (2018, nota 76).
+vPeDExternaNac <- mU_Nac[nColunaPeD, ]
+vPeDExternaImp <- mU_Imp[nColunaPeD, ]
+vPeDExterna    <- vPeDExternaNac + vPeDExternaImp
+nPeDExternaTotal <- sum(vPeDExterna)
+
+
+# 3. P&D direta = interna + externa, com a P&D externa total retirada do 7180
+
+vAjuste7180 <- rep(0, nSetores)
+vAjuste7180[nSetorPeD] <- -nPeDExternaTotal
+
+vPeDDireta_C1 <- vPeDInterna + vPeDExterna + vAjuste7180
+
+stopifnot(abs(sum(vPeDDireta_C1) - sum(vPeDInterna)) < 1e-6)
+stopifnot(all(vPeDDireta_C1 >= 0))
+
+
+# 4. Cenário 2: realocação da P&D pública e do Cenpes (proporções de 2013)
+
+lRealocacao <- fRealocarPeD(vPeDDireta_C1, dRealocacao, dReferencia, lCodigoSetores)
+vPeDDireta_C2 <- lRealocacao$vPeD
+dParametrosRealocacao <- lRealocacao$dParametros
+
+cat("Parâmetros da realocação (cenário 2):\n")
+print(dParametrosRealocacao %>%
+        group_by(origem) %>%
+        summarise(PeD_2013_antes = first(PeD_origem_2013_antes),
+                  realocado_2013 = first(total_realocado_2013),
+                  proporcao = first(proporcao_realocada),
+                  PeD_2018 = first(PeD_origem_2018),
+                  realocado_2018 = sum(valor_realocado_2018)), width = Inf)
+
+
+# 5. Intensidade em P&D direta (r_j) nos dois cenários
+
+nRMedia <- sum(vPeDDireta_C1) / sum(vX)    # igual nos dois cenários
+lCenarios <- list(C1 = list(nome = "Cenário 1 - Sem realocação",
+                            vPeDDireta = vPeDDireta_C1, vR = vPeDDireta_C1 / vX),
+                  C2 = list(nome = "Cenário 2 - Realocação de Morceiro (2013)",
+                            vPeDDireta = vPeDDireta_C2, vR = vPeDDireta_C2 / vX))
+
+dPeDDireta <- data.frame(
+  Codigo          = lCodigoSetores,
+  Setor           = lNomeSetores,
+  Producao_X      = vX,
+  PeD_interna     = vPeDInterna,
+  PeD_externa_nac = vPeDExternaNac,
+  PeD_externa_imp = vPeDExternaImp,
+  Ajuste_7180     = vAjuste7180,
+  C1 = fTabelaPeDDireta(vPeDDireta_C1, vX, nRMedia),
+  Realocacao      = vPeDDireta_C2 - vPeDDireta_C1,
+  C2 = fTabelaPeDDireta(vPeDDireta_C2, vX, nRMedia)
+)
+
+cat("\nP&D interna total ..........:", round(sum(vPeDInterna), 1), "\n")
+cat("P&D externa total ..........:", round(nPeDExternaTotal, 1),
+    "(nacional:", round(sum(vPeDExternaNac), 1), "| importada:", round(sum(vPeDExternaImp), 1), ")\n")
+cat("P&D direta total ...........:", round(sum(vPeDDireta_C1), 1), "(igual nos dois cenários)\n")
+cat("P&D / valor da produção ....:", round(100 * nRMedia, 3), "%\n")
+cat("P&D / valor adicionado .....:", round(100 * sum(vPeDDireta_C1) / sum(vVA), 3), "%\n\n")
+
+cat("Setores afetados pela realocação (R$ milhões):\n")
+print(dPeDDireta %>% filter(abs(Realocacao) > 0) %>%
+        transmute(Codigo, Setor = substr(Setor, 1, 45),
+                  PeD_C1 = round(C1.PeD_direta), Realocacao = round(Realocacao),
+                  PeD_C2 = round(C2.PeD_direta),
+                  r_C1 = round(C1.r_direta_pct, 3), r_C2 = round(C2.r_direta_pct, 3)))
+
+# 6. Tabelas no formato do Apêndice H de Morceiro (2018)
+
+# Mesmas colunas do Apêndice H até a P&D direta. As colunas de P&D indireta
+# (insumos e FBCF), o total e o multiplicador entram nos scripts seguintes.
+lNomesMorceiro <- dReferencia$setor_morceiro
+dApendiceH_C1 <- fTabelaApendiceH(vPeDDireta_C1, vX, vVA, vOcupacoes, lNomesMorceiro, lCodigoSetores)
+dApendiceH_C2 <- fTabelaApendiceH(vPeDDireta_C2, vX, vVA, vOcupacoes, lNomesMorceiro, lCodigoSetores)
+
+# Conferência: a linha TOTAL fecha em 100% e na P&D total da economia
+for (dTab in list(dApendiceH_C1, dApendiceH_C2)) {
+  dTotal <- dTab[dTab$Setor == "TOTAL", ]
+  stopifnot(abs(dTotal$PeD_pct_total - 100) < 1e-9,
+            abs(dTotal$PeD_milhoes - sum(vPeDInterna)) < 1e-6,
+            abs(dTotal$Direta_pct - 100 * nRMedia) < 1e-9)
+}
+
+cat("\nGrupos do Apêndice H - Cenário 1 x Cenário 2 (P&D direta sobre a produção, %):\n")
+print(data.frame(Grupo = dApendiceH_C1$Setor[dApendiceH_C1$Grupo],
+                 Direta_C1 = round(dApendiceH_C1$Direta_pct[dApendiceH_C1$Grupo], 2),
+                 Direta_C2 = round(dApendiceH_C2$Direta_pct[dApendiceH_C2$Grupo], 2)))
+
+# 7. Exportação (opcional)
+
+vNotas <- c(
+  "Fonte: elaboração própria a partir de IBGE (TRU 2018) e NEREUS/USP (MIP 2018).",
+  "Nota: valores correntes de 2018. PIB corresponde ao valor adicionado bruto a preços básicos. P&D / Pessoal ocupado em R$ por pessoa ocupada.",
+  "Nota: nos grupos e no total, P&D, produção, PIB e pessoal ocupado são somas dos setores; a P&D direta sobre a produção é a P&D do grupo dividida pela produção do grupo."
+)
+sNotaC2 <- "Nota: P&D dos institutos públicos de pesquisa e do Cenpes/Petrobras realocada aos setores de finalidade da pesquisa com as proporções de 2013 de Morceiro (2018, Tabelas 4.1 e 4.2)."
+
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  wb <- createWorkbook()
+  fEscreverApendiceH(wb, "Cenario 1",
+                     "INDICADORES DE P&D DIRETA PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 1: SEM REALOCAÇÃO DA P&D PÚBLICA",
+                     dApendiceH_C1, vNotas)
+  fEscreverApendiceH(wb, "Cenario 2",
+                     "INDICADORES DE P&D DIRETA PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 2: REALOCAÇÃO DA P&D PÚBLICA (MORCEIRO, 2018)",
+                     dApendiceH_C2, c(vNotas, sNotaC2))
+  addWorksheet(wb, "Dados por setor")
+  writeData(wb, "Dados por setor", dPeDDireta)
+  addWorksheet(wb, "Parametros realocacao")
+  writeData(wb, "Parametros realocacao", dParametrosRealocacao)
+  saveWorkbook(wb, file.path("Outputs", "02_PeD_direta_2018.xlsx"), overwrite = TRUE)
+}
+
+```
+
+
+##PeD indireta insumos 2018 
+
+```{r}
+# =========== Área de Funções =====================
+
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Objetos ausentes no Environment:", paste(lFaltando, collapse = ", ")))
+  }
+}
+
+# P&D indireta dos insumos nacionais (equações VII e VIII)
+#   T* = r^ B b_jj^-1 : cada coluna j de r^B dividida por b_jj (setor j exógeno)
+#   s_j^d = soma das colunas de T*;  t_j^d = s_j^d - r_j (retira a diagonal)
+fPeDIndiretaNacional <- function(vR, mB) {
+  vBjj <- diag(mB)
+  mTx <- diag(vR) %*% mB %*% diag(1 / vBjj)
+  stopifnot(max(abs(diag(mTx) - vR)) < 1e-12)   # diagonal de T* = r_j
+  vSd <- colSums(mTx)
+  return(list(mTx = mTx, vSd = vSd, vTd = vSd - diag(mTx)))
+}
+
+
+# ---------------------------------------------------------------------------------
+# Funções da tabela de saída no formato do Apêndice H de Morceiro (2018)
+# (a estrutura de grupos, fEstruturaApendiceH, vem do Script 02)
+# ---------------------------------------------------------------------------------
+
+# Indicadores de um conjunto de setores (um setor ou um grupo).
+#   - P&D, produção, PIB e pessoal ocupado: soma dos setores
+#   - componentes da P&D sobre a produção: média ponderada pela produção, o que
+#     equivale a somar a P&D de cada componente e dividir pela produção do grupo
+#   - multiplicador tecnológico: total / direta (Morceiro, 2018, eq. XIII)
+# Componentes da FBCF ainda não calculados (NULL) ficam vazios, e o total é a
+# soma dos componentes disponíveis.
+fIndicadoresCompletos <- function(vIdx, lDados) {
+  with(lDados, {
+    nPeD <- sum(vPeD[vIdx]); nX <- sum(vX[vIdx]); nVA <- sum(vVA[vIdx])
+    nOcup <- sum(vOcupacoes[vIdx])
+    fMedia <- function(v) if (is.null(v)) NA else 100 * sum(v[vIdx] * vX[vIdx]) / nX
+    vComp <- c(Direta = fMedia(vR), Indireta_insumos_nac = fMedia(vTd),
+               Indireta_insumos_imp = fMedia(vTm), Indireta_FBCF_nac = fMedia(vTdc),
+               Indireta_FBCF_imp = fMedia(vTmc))
+    nTotal <- sum(vComp, na.rm = TRUE)
+    c(PeD_milhoes        = nPeD,
+      PeD_por_ocupado_R  = ifelse(nOcup > 0, nPeD * 1e6 / nOcup, NA),
+      PeD_pct_total      = 100 * nPeD / sum(vPeD),
+      Producao_pct_total = 100 * nX / sum(vX),
+      PIB_pct_total      = 100 * nVA / sum(vVA),
+      PeD_PIB_pct        = ifelse(nVA != 0, 100 * nPeD / nVA, NA),
+      vComp,
+      Total              = nTotal,
+      Multiplicador      = ifelse(vComp[["Direta"]] > 0, nTotal / vComp[["Direta"]], NA))
+  })
+}
+
+# Monta a tabela completa no formato do Apêndice H. Dentro de cada grupo, os
+# setores são ordenados pela P&D (maior para menor), como em Morceiro (2018).
+fTabelaApendiceHCompleta <- function(lDados, lNomes, lCodigoSetores) {
+  lEstrutura <- fEstruturaApendiceH()
+  lLinhas <- list()
+  fAdicionar <- function(sNome, nNivel, bGrupo, vIdx) {
+    lLinhas[[length(lLinhas) + 1]] <<- data.frame(
+      Setor = sNome, Nivel = nNivel, Grupo = bGrupo,
+      t(fIndicadoresCompletos(vIdx, lDados)), check.names = FALSE)
+  }
+  fCodigosGrupo <- function(lGrupo) {
+    if (!is.null(lGrupo$codigos)) return(lGrupo$codigos)
+    unlist(lapply(lGrupo$subgrupos, fCodigosGrupo))
+  }
+  fPercorrer <- function(lGrupo, nNivel) {
+    vIdx <- match(fCodigosGrupo(lGrupo), lCodigoSetores)
+    fAdicionar(lGrupo$nome, nNivel, TRUE, vIdx)
+    if (!is.null(lGrupo$subgrupos)) {
+      for (lSub in lGrupo$subgrupos) fPercorrer(lSub, nNivel + 1)
+    } else if (length(vIdx) > 1) {
+      for (k in vIdx[order(-lDados$vPeD[vIdx], vIdx)]) fAdicionar(lNomes[k], nNivel + 1, FALSE, k)
+    }
+  }
+  for (lGrupo in lEstrutura) fPercorrer(lGrupo, 0)
+  fAdicionar("TOTAL", 0, TRUE, seq_along(lCodigoSetores))
+  dTabela <- bind_rows(lLinhas)
+  rownames(dTabela) <- NULL
+  return(dTabela)
+}
+
+# Escreve a tabela completa em uma aba do Excel com a formatação do Apêndice H.
+# bProvisorio = TRUE marca o Total e o Multiplicador com "(1)" (sem FBCF);
+# o Script 04, com a MAI, usa bProvisorio = FALSE.
+fEscreverApendiceHCompleto <- function(wb, sAba, sTitulo, dTabela, vNotas, bProvisorio = TRUE) {
+  sMarca <- if (bProvisorio) " (1)" else ""
+  addWorksheet(wb, sAba, gridLines = FALSE)
+  sFonte <- "Times New Roman"
+  stCab <- createStyle(fontName = sFonte, fontSize = 9, halign = "center", valign = "center",
+                       wrapText = TRUE, border = "TopBottomLeftRight", borderStyle = "thin")
+
+  writeData(wb, sAba, sTitulo, startRow = 1, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 11, textDecoration = "bold"),
+           rows = 1, cols = 1)
+
+  # Cabeçalho em três linhas (3 a 5), como no Apêndice H
+  writeData(wb, sAba, t(c("Setores de atividade do Sistema de Contas Nacionais Referência 2010",
+                          "P&D (em 10^6)", "P&D / Pessoal ocupado", "P&D", "Produção", "PIB",
+                          "P&D / PIB (em %)")),
+            startRow = 3, startCol = 1, colNames = FALSE)
+  writeData(wb, sAba, "P&D sobre a Produção (em %)", startRow = 3, startCol = 8)
+  writeData(wb, sAba, paste0("Multiplicador Tecnológico", sMarca), startRow = 3, startCol = 14)
+  writeData(wb, sAba, t(c("Direta (próprio setor)", "Indireta dos insumos nacionais",
+                          "Indireta dos insumos importados", "Indireto da FBCF nacional",
+                          "Indireto da FBCF importada", paste0("Total", sMarca))),
+            startRow = 4, startCol = 8, colNames = FALSE)
+  writeData(wb, sAba, "Em R$ milhões correntes / Em R$", startRow = 5, startCol = 2)
+  writeData(wb, sAba, "Em % do total", startRow = 5, startCol = 4)
+  mergeCells(wb, sAba, cols = 1, rows = 3:5)
+  for (j in 2:6) mergeCells(wb, sAba, cols = j, rows = 3:4)
+  mergeCells(wb, sAba, cols = 7, rows = 3:5)
+  mergeCells(wb, sAba, cols = 8:13, rows = 3)
+  for (j in 8:13) mergeCells(wb, sAba, cols = j, rows = 4:5)
+  mergeCells(wb, sAba, cols = 14, rows = 3:5)
+  mergeCells(wb, sAba, cols = 2:3, rows = 5)
+  mergeCells(wb, sAba, cols = 4:6, rows = 5)
+  addStyle(wb, sAba, stCab, rows = 3:5, cols = 1:14, gridExpand = TRUE)
+
+  # Dados
+  nInicio <- 6
+  vColunas <- c("Setor", "PeD_milhoes", "PeD_por_ocupado_R", "PeD_pct_total",
+                "Producao_pct_total", "PIB_pct_total", "PeD_PIB_pct", "Direta",
+                "Indireta_insumos_nac", "Indireta_insumos_imp", "Indireta_FBCF_nac",
+                "Indireta_FBCF_imp", "Total", "Multiplicador")
+  writeData(wb, sAba, dTabela[, vColunas], startRow = nInicio, startCol = 1,
+            colNames = FALSE, keepNA = FALSE)
+  vFormatos <- c("#,##0.0", "#,##0", rep("0.00", 10), "0.0")
+  for (i in seq_len(nrow(dTabela))) {
+    nLinha <- nInicio + i - 1
+    bGrupo <- dTabela$Grupo[i]
+    sNegrito <- if (bGrupo) "bold" else NULL
+    sBorda <- if (bGrupo) "top" else NULL
+    addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, textDecoration = sNegrito,
+                                   indent = dTabela$Nivel[i], border = sBorda, borderStyle = "thin"),
+             rows = nLinha, cols = 1)
+    for (j in seq_along(vFormatos)) {
+      sFormato <- if (j == 1 && bGrupo) "#,##0" else vFormatos[j]   # grupos sem decimal, como na tese
+      addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = sFormato,
+                                     halign = "right", textDecoration = sNegrito,
+                                     border = sBorda, borderStyle = "thin"),
+               rows = nLinha, cols = j + 1)
+    }
+  }
+  nFim <- nInicio + nrow(dTabela) - 1
+  addStyle(wb, sAba, createStyle(border = "bottom", borderStyle = "thin"),
+           rows = nFim, cols = 1:14, gridExpand = TRUE, stack = TRUE)
+
+  # Notas e fonte
+  writeData(wb, sAba, vNotas, startRow = nFim + 2, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8),
+           rows = (nFim + 2):(nFim + 1 + length(vNotas)), cols = 1)
+  setColWidths(wb, sAba, cols = 1, widths = 52)
+  setColWidths(wb, sAba, cols = 2:14, widths = 10)
+  setRowHeights(wb, sAba, rows = 4, heights = 40)
+  freezePane(wb, sAba, firstActiveRow = nInicio, firstActiveCol = 2)
+}
+
+# =========== Área do código principal ============
+bExportarResultados = FALSE   # FALSE para não salvar em ./Outputs
+
+# Objetos dos Scripts 01 e 02
+fVerificarObjetos(c("mLeontief", "mV_MIP", "mU_Imp", "vX", "vVA", "vOcupacoes",
+                    "fEstruturaApendiceH", "lCodigoSetores",
+                    "lNomeSetores", "lCodigoProdutos", "lNomeProdutos",
+                    "lCenarios", "dReferencia"))
+stopifnot(all(dReferencia$codigo == lCodigoSetores))   # mesma ordem de setores
+
+#################################################################################
+# 1. Matriz de insumos importados setor x setor (M)
+#################################################################################
+# As importações da MIP estão em produto x setor (128 x 68). Para associar cada
+# produto importado a um setor de origem i, usa-se a participação de cada setor
+# na produção doméstica de cada produto (market share, hipótese de tecnologia
+# do setor - Miller e Blair, 2009):
+#   D = V q^-1  (setor x produto),   q_p = produção doméstica total do produto p
+#   M_sxs = D %*% M_pxs
+vQ <- colSums(mV_MIP)
+mD <- t(t(mV_MIP) / ifelse(vQ == 0, 1, vQ))
+
+# Conferência: produtos importados sem produção doméstica se perderiam
+vProdutosSemProducao <- which(vQ == 0 & rowSums(mU_Imp) > 0)
+cat("Produtos importados sem produção doméstica:", length(vProdutosSemProducao), "\n")
+if (length(vProdutosSemProducao) > 0) {
+  print(data.frame(Codigo = lCodigoProdutos[vProdutosSemProducao],
+                   Produto = lNomeProdutos[vProdutosSemProducao],
+                   Importacao = rowSums(mU_Imp)[vProdutosSemProducao]))
+}
+
+mImpSxS <- mD %*% mU_Imp
+stopifnot(abs(sum(mImpSxS) - sum(mU_Imp)) < 1e-3)    # nada se perde na conversão
+
+mM <- t(t(mImpSxS) / vX)          # m_ij = importação do setor i pelo setor j / X_j
+
+
+# 2. P&D indireta dos insumos importados (t_j^m) - equação IX
+
+# Tabela K: "-" significa sem informação.
+#  - Manutenção, reparação e instalação de M&Es (3300): só a intensidade direta
+#    está disponível (0,80%); ela é usada como aproximação (limite inferior).
+#  - Serviços domésticos (9700): zero (não há importação desse serviço).
+vRf <- dReferencia$K_direta_indireta
+vRf[is.na(vRf)] <- dReferencia$K_direta[is.na(vRf)]
+vRf[is.na(vRf)] <- 0
+vRf <- vRf / 100                  # de % para fração
+
+vTm <- as.vector(t(mM) %*% vRf)   # t_j^m = soma_i r_i^f m_ij
+
+
+# 3. Componentes nos dois cenários
+
+mB <- mLeontief
+lResultados <- list()
+
+for (sCenario in names(lCenarios)) {
+  vR <- lCenarios[[sCenario]]$vR
+  lNac <- fPeDIndiretaNacional(vR, mB)
+  vSubtotal <- vR + lNac$vTd + vTm
+
+  lResultados[[sCenario]] <- list(vR = vR, vSd = lNac$vSd, vTd = lNac$vTd, vTm = vTm,
+                                  vSubtotal = vSubtotal)
+
+  cat("\n", lCenarios[[sCenario]]$nome, "- médias da economia (ponderadas pela produção):\n")
+  cat("  r direta ...............:", round(100 * sum(vR * vX) / sum(vX), 3), "%\n")
+  cat("  t insumos nacionais ....:", round(100 * sum(lNac$vTd * vX) / sum(vX), 3), "%\n")
+  cat("  t insumos importados ...:", round(100 * sum(vTm * vX) / sum(vX), 3), "%\n")
+}
+
+# Tabela de componentes, lado a lado
+fColunas <- function(lRes, sPrefixo) {
+  d <- data.frame(100 * lRes$vR, 100 * lRes$vTd, 100 * lRes$vTm, 100 * lRes$vSubtotal)
+  names(d) <- paste0(sPrefixo, c("_r_direta_pct", "_t_insumos_nac_pct",
+                                 "_t_insumos_imp_pct", "_subtotal_pct"))
+  return(d)
+}
+dComponentes <- data.frame(Codigo = lCodigoSetores, Setor = lNomeSetores,
+                           fColunas(lResultados$C1, "C1"),
+                           fColunas(lResultados$C2, "C2"),
+                           Coef_importado = colSums(mM),
+                           Rf_fronteira_pct = 100 * vRf)
+
+
+# 4. Comparação com 2013 (Morceiro, 2018, Apêndice H - com realocação)
+
+# O cenário comparável com 2013 é o C2, porque o Apêndice H já tem a realocação.
+dComparacao <- data.frame(
+  Codigo = lCodigoSetores,
+  Setor = dReferencia$setor_morceiro,
+  Direta_2013 = dReferencia$H_direta,
+  Direta_2018_C1 = 100 * lResultados$C1$vR, Direta_2018_C2 = 100 * lResultados$C2$vR,
+  InsNac_2013 = dReferencia$H_ind_insumos_nac,
+  InsNac_2018_C1 = 100 * lResultados$C1$vTd, InsNac_2018_C2 = 100 * lResultados$C2$vTd,
+  InsImp_2013 = dReferencia$H_ind_insumos_imp, InsImp_2018 = 100 * vTm
+)
+dCorrelacoes <- data.frame(
+  Componente = c("P&D direta", "Insumos nacionais", "Insumos importados"),
+  Pearson_C1 = c(cor(dComparacao$Direta_2013, dComparacao$Direta_2018_C1),
+                 cor(dComparacao$InsNac_2013, dComparacao$InsNac_2018_C1),
+                 cor(dComparacao$InsImp_2013, dComparacao$InsImp_2018)),
+  Pearson_C2 = c(cor(dComparacao$Direta_2013, dComparacao$Direta_2018_C2),
+                 cor(dComparacao$InsNac_2013, dComparacao$InsNac_2018_C2),
+                 cor(dComparacao$InsImp_2013, dComparacao$InsImp_2018)),
+  Spearman_C1 = c(cor(dComparacao$Direta_2013, dComparacao$Direta_2018_C1, method = "spearman"),
+                  cor(dComparacao$InsNac_2013, dComparacao$InsNac_2018_C1, method = "spearman"),
+                  cor(dComparacao$InsImp_2013, dComparacao$InsImp_2018, method = "spearman")),
+  Spearman_C2 = c(cor(dComparacao$Direta_2013, dComparacao$Direta_2018_C2, method = "spearman"),
+                  cor(dComparacao$InsNac_2013, dComparacao$InsNac_2018_C2, method = "spearman"),
+                  cor(dComparacao$InsImp_2013, dComparacao$InsImp_2018, method = "spearman"))
+)
+cat("\nCorrelação 2013 x 2018 (68 setores):\n")
+print(dCorrelacoes, digits = 3)
+
+# 5. Tabelas no formato do Apêndice H de Morceiro (2018)
+
+fDadosCenario <- function(sCenario) {
+  list(vPeD = lCenarios[[sCenario]]$vPeDDireta, vX = vX, vVA = vVA, vOcupacoes = vOcupacoes,
+       vR = lResultados[[sCenario]]$vR, vTd = lResultados[[sCenario]]$vTd,
+       vTm = lResultados[[sCenario]]$vTm,
+       vTdc = NULL,    # FBCF nacional: aguardando a MAI
+       vTmc = NULL)    # FBCF importada: aguardando a MAI
+}
+lNomesMorceiro <- dReferencia$setor_morceiro
+dApendiceHCompleto_C1 <- fTabelaApendiceHCompleta(fDadosCenario("C1"), lNomesMorceiro, lCodigoSetores)
+dApendiceHCompleto_C2 <- fTabelaApendiceHCompleta(fDadosCenario("C2"), lNomesMorceiro, lCodigoSetores)
+
+# Conferências: a linha TOTAL fecha em 100% e reproduz as médias da economia
+for (sCenario in c("C1", "C2")) {
+  dTab <- if (sCenario == "C1") dApendiceHCompleto_C1 else dApendiceHCompleto_C2
+  dTotal <- dTab[dTab$Setor == "TOTAL", ]
+  vRc <- lResultados[[sCenario]]
+  stopifnot(abs(dTotal$PeD_pct_total - 100) < 1e-9,
+            abs(dTotal$Direta - 100 * sum(vRc$vR * vX) / sum(vX)) < 1e-9,
+            abs(dTotal$Indireta_insumos_nac - 100 * sum(vRc$vTd * vX) / sum(vX)) < 1e-9,
+            abs(dTotal$Indireta_insumos_imp - 100 * sum(vRc$vTm * vX) / sum(vX)) < 1e-9)
+}
+
+cat("\nGrupos do Apêndice H - Cenário 2 (comparável com 2013):\n")
+print(dApendiceHCompleto_C2[dApendiceHCompleto_C2$Grupo,
+                            c("Setor", "Direta", "Indireta_insumos_nac",
+                              "Indireta_insumos_imp", "Total", "Multiplicador")], digits = 3)
+# 6. Exportação (opcional)
+
+vNotas <- c(
+  "Fonte: elaboração própria a partir de IBGE (TRU 2018), NEREUS/USP (MIP 2018) e Morceiro (2018, Tabela K).",
+  "Nota: valores correntes de 2018. PIB corresponde ao valor adicionado bruto a preços básicos. P&D / Pessoal ocupado em R$ por pessoa ocupada.",
+  "Nota: nos grupos e no total, P&D, produção, PIB e pessoal ocupado são somas dos setores; os componentes da P&D sobre a produção são médias ponderadas pela produção.",
+  "(1) Provisório: não inclui os componentes da FBCF nacional e importada, que dependem da Matriz de Absorção de Investimento (MAI)."
+)
+sNotaC2 <- "Nota: P&D dos institutos públicos de pesquisa e do Cenpes/Petrobras realocada aos setores de finalidade da pesquisa com as proporções de 2013 de Morceiro (2018, Tabelas 4.1 e 4.2)."
+
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  wb <- createWorkbook()
+  fEscreverApendiceHCompleto(wb, "Cenario 1",
+                             "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 1: SEM REALOCAÇÃO DA P&D PÚBLICA",
+                             dApendiceHCompleto_C1, vNotas)
+  fEscreverApendiceHCompleto(wb, "Cenario 2",
+                             "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 2: REALOCAÇÃO DA P&D PÚBLICA (MORCEIRO, 2018)",
+                             dApendiceHCompleto_C2, c(vNotas, sNotaC2))
+  addWorksheet(wb, "Componentes por setor")
+  writeData(wb, "Componentes por setor", dComponentes)
+  addWorksheet(wb, "Comparacao 2013 x 2018")
+  writeData(wb, "Comparacao 2013 x 2018", dComparacao)
+  addWorksheet(wb, "Correlacoes")
+  writeData(wb, "Correlacoes", dCorrelacoes)
+  saveWorkbook(wb, file.path("Outputs", "03_PeD_indireta_insumos_2018.xlsx"), overwrite = TRUE)
+}
+
+```
+
+
+
+##PeD indireta FBCF 2018 - MAI
+
+
+```{r}
+# =========== Área de Funções =====================
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Objetos ausentes no Environment:", paste(lFaltando, collapse = ", ")))
+  }
+}
+
+# Lê os blocos da MAI. As linhas trazem os setores fornecedores duas vezes
+# (primeiro o bloco nacional, depois o importado), com a linha "hh" (Famílias)
+# ao fim do bloco nacional; as colunas trazem os 68 setores que investem e a
+# coluna "hh" (Famílias).
+# Usa fColunaCodigo e fMatrizNumerica, definidas no Script 01.
+fLerMAI <- function(dMAI, lCodigoSetores) {
+  nSetores <- length(lCodigoSetores)
+  vColuna1 <- trimws(as.character(dMAI[[1]]))
+  vInicios <- which(vColuna1 == lCodigoSetores[1])
+  if (length(vInicios) != 2) stop("A MAI deve ter dois blocos de linhas (nacional e importado).")
+  vLinhasNac <- vInicios[1] + 0:(nSetores - 1)
+  vLinhasImp <- vInicios[2] + 0:(nSetores - 1)
+  nLinhaHH   <- which(vColuna1 == "hh")
+
+  lColuna  <- fColunaCodigo(dMAI, lCodigoSetores[1], vInicios[1] - 1)
+  vColunas <- lColuna$nColuna + 0:(nSetores - 1)
+  nColunaHH <- which(trimws(lColuna$vCabecalho) == "hh")
+
+  list(mNac      = fMatrizNumerica(dMAI[vLinhasNac, vColunas]),
+       mImp      = fMatrizNumerica(dMAI[vLinhasImp, vColunas]),
+       vLinhaHH  = fMatrizNumerica(dMAI[nLinhaHH, vColunas])[1, ],
+       vColHHNac = fMatrizNumerica(dMAI[c(vLinhasNac, nLinhaHH), nColunaHH])[, 1],
+       vColHHImp = fMatrizNumerica(dMAI[vLinhasImp, nColunaHH])[, 1],
+       lCodLinhasNac = vColuna1[vLinhasNac],
+       lCodLinhasImp = vColuna1[vLinhasImp],
+       lCodColunas   = trimws(lColuna$vCabecalho[vColunas]),
+       mTodas    = fMatrizNumerica(dMAI[c(vLinhasNac, nLinhaHH, vLinhasImp),
+                                        c(vColunas, nColunaHH)]))
+}
+
+# Registra o resultado de uma conferência (diferença máxima absoluta)
+fConferencia <- function(sDescricao, nDiferenca, nTolerancia = 1e-6) {
+  data.frame(Conferencia = sDescricao,
+             Diferenca_maxima = as.numeric(nDiferenca),
+             Resultado = ifelse(abs(nDiferenca) <= nTolerancia, "OK", "VERIFICAR"))
+}
+
+# =========== Área do código principal ============
+bExportarResultados = TRUE   # FALSE para não salvar em ./Outputs
+bExportarApoio = FALSE        # TRUE inclui as abas de apoio (comparação com 2013,
+                              # correlações e conferências da MAI)
+
+fVerificarObjetos(c("dMAI", "lCodigoSetores", "lNomeSetores", "nProdutos", "vX", "vVA",
+                    "vOcupacoes", "lResultados", "lCenarios", "vRf", "dReferencia",
+                    "dUsosSxS", "dImportacoes", "lZ", "lUImp", "mD",
+                    "fColunaCodigo", "fColunaTexto", "fMatrizNumerica",
+                    "fTabelaApendiceHCompleta", "fEscreverApendiceHCompleto"))
+nSetores <- length(lCodigoSetores)
+
+
+# 1. Leitura da MAI
+
+lMAI <- fLerMAI(as.data.frame(dMAI), lCodigoSetores)
+
+# Linha "Famílias": parcela do investimento em construção (cerca de 0,315 da
+# linha da Construção nos setores que investem; é zero na agropecuária e na
+# saúde privada). É somada à Construção (4180) como setor fornecedor.
+nConstrucao <- which(lCodigoSetores == "4180")
+vRazaoHH <- lMAI$vLinhaHH / ifelse(lMAI$mNac[nConstrucao, ] == 0, NA, lMAI$mNac[nConstrucao, ])
+
+mMAI_Nac <- lMAI$mNac
+mMAI_Nac[nConstrucao, ] <- mMAI_Nac[nConstrucao, ] + lMAI$vLinhaHH
+mMAI_Imp <- lMAI$mImp
+# A coluna "Famílias" (famílias como compradoras de investimento) é excluída,
+# pois não corresponde a um setor produtivo.
+
+
+# 2. Conferências da MAI
+
+# FBCF por setor fornecedor na MIP do NEREUS (para comparação de ordem de grandeza)
+nColunaFBCF <- fColunaTexto(dUsosSxS, "Formação bruta", lZ$nLinha - 1)
+vFBCF_MIP_Nac <- fMatrizNumerica(dUsosSxS[lZ$nLinha + 0:(nSetores - 1), nColunaFBCF])[, 1]
+nColunaFBCFImp <- fColunaTexto(dImportacoes, "Formação bruta", lUImp$nLinha - 1)
+vFBCF_MIP_ImpProd <- fMatrizNumerica(dImportacoes[lUImp$nLinha + 0:(nProdutos - 1), nColunaFBCFImp])[, 1]
+vFBCF_MIP_Imp <- as.vector(mD %*% vFBCF_MIP_ImpProd)    # produto -> setor (market share)
+
+nTotalMAI_Nac <- sum(lMAI$mNac) + sum(lMAI$vLinhaHH) + sum(lMAI$vColHHNac)
+nTotalMAI_Imp <- sum(lMAI$mImp) + sum(lMAI$vColHHImp)
+
+lConf <- list(
+  fConferencia("Ordem dos setores fornecedores (bloco nacional) = MIP",
+               sum(lMAI$lCodLinhasNac != lCodigoSetores)),
+  fConferencia("Ordem dos setores fornecedores (bloco importado) = MIP",
+               sum(lMAI$lCodLinhasImp != lCodigoSetores)),
+  fConferencia("Ordem dos setores que investem (colunas) = MIP",
+               sum(lMAI$lCodColunas != lCodigoSetores)),
+  fConferencia("Células negativas na MAI", sum(lMAI$mTodas < 0)),
+  fConferencia("Linha Famílias / linha Construção, onde Famílias > 0 (desvio de 0,315)",
+               max(abs(vRazaoHH[lMAI$vLinhaHH > 0] - 0.315), na.rm = TRUE), nTolerancia = 0.01),
+  fConferencia("Soma da Construção como fornecedor = linha 4180 + linha Famílias",
+               abs(sum(mMAI_Nac[nConstrucao, ]) -
+                     (sum(lMAI$mNac[nConstrucao, ]) + sum(lMAI$vLinhaHH))))
+)
+dConferenciasMAI <- bind_rows(lConf)
+rownames(dConferenciasMAI) <- NULL
+print(dConferenciasMAI)
+
+cat("\nTotais da MAI (R$ milhões):\n")
+cat("  Nacional, com Famílias ..........:", round(nTotalMAI_Nac, 1),
+    " | FBCF nacional na MIP:", round(sum(vFBCF_MIP_Nac), 1), "\n")
+cat("  Importada .......................:", round(nTotalMAI_Imp, 1),
+    " | FBCF importada na MIP:", round(sum(vFBCF_MIP_Imp), 1), "\n")
+cat("  Usada no cálculo (sem coluna Famílias): nacional", round(sum(mMAI_Nac), 1),
+    "| importada", round(sum(mMAI_Imp), 1), "\n")
+
+dComparacaoFBCF <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomeSetores,
+  MAI_nac_fornecido = rowSums(mMAI_Nac) + c(lMAI$vColHHNac[1:nSetores]) +
+    ifelse(seq_len(nSetores) == nConstrucao, lMAI$vColHHNac[nSetores + 1], 0),
+  MIP_FBCF_nac = vFBCF_MIP_Nac,
+  MAI_imp_fornecido = rowSums(mMAI_Imp) + lMAI$vColHHImp,
+  MIP_FBCF_imp = vFBCF_MIP_Imp,
+  MAI_nac_investido = colSums(mMAI_Nac),
+  MAI_imp_investido = colSums(mMAI_Imp)
+)
+
+# 3. Coeficientes de investimento por unidade de produção (C)
+
+mC_Nac <- t(t(mMAI_Nac) / vX)     # c_ij^d = MAI nacional_ij / X_j
+mC_Imp <- t(t(mMAI_Imp) / vX)     # c_ij^m = MAI importada_ij / X_j
+
+
+# 4. P&D indireta da FBCF nos dois cenários (equações X e XI)
+
+vTmc <- as.vector(t(mC_Imp) %*% vRf)          # t_j^mc = soma_i r_i^f c_ij^m (igual nos dois cenários)
+
+for (sCenario in names(lResultados)) {
+  vSd  <- lResultados[[sCenario]]$vSd          # s_i^d = r_i + t_i^d
+  vTdc <- as.vector(t(mC_Nac) %*% vSd)         # t_j^dc = soma_i s_i^d c_ij^d
+  lResultados[[sCenario]]$vTdc <- vTdc
+  lResultados[[sCenario]]$vTmc <- vTmc
+  lResultados[[sCenario]]$vTotal <- with(lResultados[[sCenario]], vR + vTd + vTm + vTdc + vTmc)
+  lResultados[[sCenario]]$vMultiplicador <- with(lResultados[[sCenario]],
+                                                 ifelse(vR > 0, vTotal / vR, NA))
+  cat("\n", lCenarios[[sCenario]]$nome, "- médias da economia (ponderadas pela produção):\n")
+  fMediaPond <- function(v) round(100 * sum(v * vX) / sum(vX), 3)
+  with(lResultados[[sCenario]], {
+    cat("  r direta ...........:", fMediaPond(vR), "%\n")
+    cat("  t insumos nacionais :", fMediaPond(vTd), "%\n")
+    cat("  t insumos importados:", fMediaPond(vTm), "%\n")
+    cat("  t FBCF nacional ....:", fMediaPond(vTdc), "%\n")
+    cat("  t FBCF importada ...:", fMediaPond(vTmc), "%\n")
+    cat("  Total ..............:", fMediaPond(vTotal), "%\n")
+  })
+}
+
+
+# 5. Tabelas finais no formato do Apêndice H
+
+fDadosFinal <- function(sCenario) {
+  with(lResultados[[sCenario]],
+       list(vPeD = lCenarios[[sCenario]]$vPeDDireta, vX = vX, vVA = vVA,
+            vOcupacoes = vOcupacoes, vR = vR, vTd = vTd, vTm = vTm,
+            vTdc = vTdc, vTmc = vTmc))
+}
+lNomesMorceiro <- dReferencia$setor_morceiro
+dIndicadoresFinal_C1 <- fTabelaApendiceHCompleta(fDadosFinal("C1"), lNomesMorceiro, lCodigoSetores)
+dIndicadoresFinal_C2 <- fTabelaApendiceHCompleta(fDadosFinal("C2"), lNomesMorceiro, lCodigoSetores)
+
+# Conferência: o total da tabela é a soma dos cinco componentes
+for (dTab in list(dIndicadoresFinal_C1, dIndicadoresFinal_C2)) {
+  stopifnot(max(abs(dTab$Total - (dTab$Direta + dTab$Indireta_insumos_nac +
+                                    dTab$Indireta_insumos_imp + dTab$Indireta_FBCF_nac +
+                                    dTab$Indireta_FBCF_imp))) < 1e-9)
+}
+
+
+# 6. Comparação com 2013 (Morceiro, 2018, Apêndice H - com realocação)
+
+lR2 <- lResultados$C2
+dComparacaoFinal <- data.frame(
+  Codigo = lCodigoSetores, Setor = dReferencia$setor_morceiro,
+  FBCFnac_2013 = dReferencia$H_ind_fbcf_nac, FBCFnac_2018_C2 = 100 * lR2$vTdc,
+  FBCFimp_2013 = dReferencia$H_ind_fbcf_imp, FBCFimp_2018 = 100 * lR2$vTmc,
+  Total_2013 = dReferencia$H_total, Total_2018_C2 = 100 * lR2$vTotal,
+  Mult_2013 = dReferencia$H_multiplicador, Mult_2018_C2 = lR2$vMultiplicador
+)
+fCor <- function(a, b, m) cor(a, b, method = m, use = "complete.obs")
+dCorrelacoesFinal <- data.frame(
+  Componente = c("Indireta FBCF nacional", "Indireta FBCF importada", "Total", "Multiplicador"),
+  Pearson = c(fCor(dComparacaoFinal$FBCFnac_2013, dComparacaoFinal$FBCFnac_2018_C2, "pearson"),
+              fCor(dComparacaoFinal$FBCFimp_2013, dComparacaoFinal$FBCFimp_2018, "pearson"),
+              fCor(dComparacaoFinal$Total_2013, dComparacaoFinal$Total_2018_C2, "pearson"),
+              fCor(dComparacaoFinal$Mult_2013, dComparacaoFinal$Mult_2018_C2, "pearson")),
+  Spearman = c(fCor(dComparacaoFinal$FBCFnac_2013, dComparacaoFinal$FBCFnac_2018_C2, "spearman"),
+               fCor(dComparacaoFinal$FBCFimp_2013, dComparacaoFinal$FBCFimp_2018, "spearman"),
+               fCor(dComparacaoFinal$Total_2013, dComparacaoFinal$Total_2018_C2, "spearman"),
+               fCor(dComparacaoFinal$Mult_2013, dComparacaoFinal$Mult_2018_C2, "spearman"))
+)
+cat("\nCorrelação 2013 x 2018 (cenário 2, 68 setores):\n")
+print(dCorrelacoesFinal, digits = 3)
+
+
+# 7. Exportação (opcional)
+
+vNotas <- c(
+  "Fonte: elaboração própria a partir de IBGE (TRU 2018), NEREUS/USP (MIP 2018), IPEA (MAI 2018) e Morceiro (2018, Tabela K).",
+  "Nota: valores correntes de 2018. PIB corresponde ao valor adicionado bruto a preços básicos. P&D / Pessoal ocupado em R$ por pessoa ocupada.",
+  "Nota: nos grupos e no total, P&D, produção, PIB e pessoal ocupado são somas dos setores; os componentes da P&D sobre a produção são médias ponderadas pela produção.",
+  "Nota: na MAI, a linha Famílias foi somada à Construção como setor fornecedor, e a coluna Famílias (investimento das famílias) foi excluída."
+)
+sNotaC2 <- "Nota: P&D dos institutos públicos de pesquisa e do Cenpes/Petrobras realocada aos setores de finalidade da pesquisa com as proporções de 2013 de Morceiro (2018, Tabelas 4.1 e 4.2)."
+
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  wb <- createWorkbook()
+  fEscreverApendiceHCompleto(wb, "Cenario 1",
+                             "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 1: SEM REALOCAÇÃO DA P&D PÚBLICA",
+                             dIndicadoresFinal_C1, vNotas, bProvisorio = FALSE)
+  fEscreverApendiceHCompleto(wb, "Cenario 2",
+                             "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - CENÁRIO 2: REALOCAÇÃO DA P&D PÚBLICA (MORCEIRO, 2018)",
+                             dIndicadoresFinal_C2, c(vNotas, sNotaC2), bProvisorio = FALSE)
+  if (bExportarApoio) {
+    addWorksheet(wb, "Comparacao 2013 x 2018")
+    writeData(wb, "Comparacao 2013 x 2018", dComparacaoFinal)
+    addWorksheet(wb, "Correlacoes")
+    writeData(wb, "Correlacoes", dCorrelacoesFinal)
+    addWorksheet(wb, "Conferencias MAI")
+    writeData(wb, "Conferencias MAI", dConferenciasMAI)
+    addWorksheet(wb, "MAI x MIP por setor")
+    writeData(wb, "MAI x MIP por setor", dComparacaoFBCF)
+  }
+  saveWorkbook(wb, file.path("Outputs", "Indicadores_PeD_2018.xlsx"), overwrite = TRUE)
+}
+
+
+```
+
+
+
+## Indicadores P&D 2018 - FINAL 
+```{r}
+
+# Verifica se os objetos necessários estão no Environment
+fVerificarObjetos <- function(lObjetos) {
+  lFaltando <- lObjetos[!sapply(lObjetos, exists)]
+  if (length(lFaltando) > 0) {
+    stop(paste("Objetos ausentes no Environment:", paste(lFaltando, collapse = ", ")))
+  }
+}
+
+# Lê os blocos da MAI. As linhas trazem os setores fornecedores duas vezes
+# (primeiro o bloco nacional, depois o importado), com a linha "hh" (Famílias)
+# ao fim do bloco nacional; as colunas trazem os 68 setores que investem e a
+# coluna "hh" (Famílias).
+# Usa fColunaCodigo e fMatrizNumerica, definidas no Script 01.
+fLerMAI <- function(dMAI, lCodigoSetores) {
+  nSetores <- length(lCodigoSetores)
+  vColuna1 <- trimws(as.character(dMAI[[1]]))
+  vInicios <- which(vColuna1 == lCodigoSetores[1])
+  if (length(vInicios) != 2) stop("A MAI deve ter dois blocos de linhas (nacional e importado).")
+  vLinhasNac <- vInicios[1] + 0:(nSetores - 1)
+  vLinhasImp <- vInicios[2] + 0:(nSetores - 1)
+  nLinhaHH   <- which(vColuna1 == "hh")
+
+  lColuna  <- fColunaCodigo(dMAI, lCodigoSetores[1], vInicios[1] - 1)
+  vColunas <- lColuna$nColuna + 0:(nSetores - 1)
+  nColunaHH <- which(trimws(lColuna$vCabecalho) == "hh")
+
+  list(mNac      = fMatrizNumerica(dMAI[vLinhasNac, vColunas]),
+       mImp      = fMatrizNumerica(dMAI[vLinhasImp, vColunas]),
+       vLinhaHH  = fMatrizNumerica(dMAI[nLinhaHH, vColunas])[1, ],
+       vColHHNac = fMatrizNumerica(dMAI[c(vLinhasNac, nLinhaHH), nColunaHH])[, 1],
+       vColHHImp = fMatrizNumerica(dMAI[vLinhasImp, nColunaHH])[, 1],
+       lCodLinhasNac = vColuna1[vLinhasNac],
+       lCodLinhasImp = vColuna1[vLinhasImp],
+       lCodColunas   = trimws(lColuna$vCabecalho[vColunas]),
+       mTodas    = fMatrizNumerica(dMAI[c(vLinhasNac, nLinhaHH, vLinhasImp),
+                                        c(vColunas, nColunaHH)]))
+}
+
+# Registra o resultado de uma conferência (diferença máxima absoluta)
+fConferencia <- function(sDescricao, nDiferenca, nTolerancia = 1e-6) {
+  data.frame(Conferencia = sDescricao,
+             Diferenca_maxima = as.numeric(nDiferenca),
+             Resultado = ifelse(abs(nDiferenca) <= nTolerancia, "OK", "VERIFICAR"))
+}
+
+# =========== Área do código principal ============
+bExportarResultados = TRUE   # FALSE para não salvar em ./Outputs
+bExportarApoio = FALSE        # TRUE inclui as abas de apoio (comparação com 2013,
+                              # correlações e conferências da MAI)
+
+fVerificarObjetos(c("dMAI", "lCodigoSetores", "lNomeSetores", "nProdutos", "vX", "vVA",
+                    "vOcupacoes", "lResultados", "lCenarios", "vRf", "dReferencia",
+                    "dUsosSxS", "dImportacoes", "lZ", "lUImp", "mD",
+                    "fColunaCodigo", "fColunaTexto", "fMatrizNumerica",
+                    "fTabelaApendiceHCompleta", "fEscreverApendiceHCompleto"))
+nSetores <- length(lCodigoSetores)
+
+#################################################################################
+# 1. Leitura da MAI
+#################################################################################
+lMAI <- fLerMAI(as.data.frame(dMAI), lCodigoSetores)
+
+# Linha "Famílias": parcela do investimento em construção (cerca de 0,315 da
+# linha da Construção nos setores que investem; é zero na agropecuária e na
+# saúde privada). É somada à Construção (4180) como setor fornecedor.
+nConstrucao <- which(lCodigoSetores == "4180")
+vRazaoHH <- lMAI$vLinhaHH / ifelse(lMAI$mNac[nConstrucao, ] == 0, NA, lMAI$mNac[nConstrucao, ])
+
+mMAI_Nac <- lMAI$mNac
+mMAI_Nac[nConstrucao, ] <- mMAI_Nac[nConstrucao, ] + lMAI$vLinhaHH
+mMAI_Imp <- lMAI$mImp
+# A coluna "Famílias" (famílias como compradoras de investimento) é excluída,
+# pois não corresponde a um setor produtivo.
+
+#################################################################################
+# 2. Conferências da MAI
+#################################################################################
+# FBCF por setor fornecedor na MIP do NEREUS (para comparação de ordem de grandeza)
+nColunaFBCF <- fColunaTexto(dUsosSxS, "Formação bruta", lZ$nLinha - 1)
+vFBCF_MIP_Nac <- fMatrizNumerica(dUsosSxS[lZ$nLinha + 0:(nSetores - 1), nColunaFBCF])[, 1]
+nColunaFBCFImp <- fColunaTexto(dImportacoes, "Formação bruta", lUImp$nLinha - 1)
+vFBCF_MIP_ImpProd <- fMatrizNumerica(dImportacoes[lUImp$nLinha + 0:(nProdutos - 1), nColunaFBCFImp])[, 1]
+vFBCF_MIP_Imp <- as.vector(mD %*% vFBCF_MIP_ImpProd)    # produto -> setor (market share)
+
+nTotalMAI_Nac <- sum(lMAI$mNac) + sum(lMAI$vLinhaHH) + sum(lMAI$vColHHNac)
+nTotalMAI_Imp <- sum(lMAI$mImp) + sum(lMAI$vColHHImp)
+
+lConf <- list(
+  fConferencia("Ordem dos setores fornecedores (bloco nacional) = MIP",
+               sum(lMAI$lCodLinhasNac != lCodigoSetores)),
+  fConferencia("Ordem dos setores fornecedores (bloco importado) = MIP",
+               sum(lMAI$lCodLinhasImp != lCodigoSetores)),
+  fConferencia("Ordem dos setores que investem (colunas) = MIP",
+               sum(lMAI$lCodColunas != lCodigoSetores)),
+  fConferencia("Células negativas na MAI", sum(lMAI$mTodas < 0)),
+  fConferencia("Linha Famílias / linha Construção, onde Famílias > 0 (desvio de 0,315)",
+               max(abs(vRazaoHH[lMAI$vLinhaHH > 0] - 0.315), na.rm = TRUE), nTolerancia = 0.01),
+  fConferencia("Soma da Construção como fornecedor = linha 4180 + linha Famílias",
+               abs(sum(mMAI_Nac[nConstrucao, ]) -
+                     (sum(lMAI$mNac[nConstrucao, ]) + sum(lMAI$vLinhaHH))))
+)
+dConferenciasMAI <- bind_rows(lConf)
+rownames(dConferenciasMAI) <- NULL
+print(dConferenciasMAI)
+
+cat("\nTotais da MAI (R$ milhões):\n")
+cat("  Nacional, com Famílias ..........:", round(nTotalMAI_Nac, 1),
+    " | FBCF nacional na MIP:", round(sum(vFBCF_MIP_Nac), 1), "\n")
+cat("  Importada .......................:", round(nTotalMAI_Imp, 1),
+    " | FBCF importada na MIP:", round(sum(vFBCF_MIP_Imp), 1), "\n")
+cat("  Usada no cálculo (sem coluna Famílias): nacional", round(sum(mMAI_Nac), 1),
+    "| importada", round(sum(mMAI_Imp), 1), "\n")
+
+dComparacaoFBCF <- data.frame(
+  Codigo = lCodigoSetores, Setor = lNomeSetores,
+  MAI_nac_fornecido = rowSums(mMAI_Nac) + c(lMAI$vColHHNac[1:nSetores]) +
+    ifelse(seq_len(nSetores) == nConstrucao, lMAI$vColHHNac[nSetores + 1], 0),
+  MIP_FBCF_nac = vFBCF_MIP_Nac,
+  MAI_imp_fornecido = rowSums(mMAI_Imp) + lMAI$vColHHImp,
+  MIP_FBCF_imp = vFBCF_MIP_Imp,
+  MAI_nac_investido = colSums(mMAI_Nac),
+  MAI_imp_investido = colSums(mMAI_Imp)
+)
+
+#################################################################################
+# 3. Coeficientes de investimento por unidade de produção (C)
+#################################################################################
+mC_Nac <- t(t(mMAI_Nac) / vX)     # c_ij^d = MAI nacional_ij / X_j
+mC_Imp <- t(t(mMAI_Imp) / vX)     # c_ij^m = MAI importada_ij / X_j
+
+#################################################################################
+# 4. P&D indireta da FBCF nos dois cenários (equações X e XI)
+#################################################################################
+vTmc <- as.vector(t(mC_Imp) %*% vRf)          # t_j^mc = soma_i r_i^f c_ij^m (igual nos dois cenários)
+
+for (sCenario in names(lResultados)) {
+  vSd  <- lResultados[[sCenario]]$vSd          # s_i^d = r_i + t_i^d
+  vTdc <- as.vector(t(mC_Nac) %*% vSd)         # t_j^dc = soma_i s_i^d c_ij^d
+  lResultados[[sCenario]]$vTdc <- vTdc
+  lResultados[[sCenario]]$vTmc <- vTmc
+  lResultados[[sCenario]]$vTotal <- with(lResultados[[sCenario]], vR + vTd + vTm + vTdc + vTmc)
+  lResultados[[sCenario]]$vMultiplicador <- with(lResultados[[sCenario]],
+                                                 ifelse(vR > 0, vTotal / vR, NA))
+  cat("\n", lCenarios[[sCenario]]$nome, "- médias da economia (ponderadas pela produção):\n")
+  fMediaPond <- function(v) round(100 * sum(v * vX) / sum(vX), 3)
+  with(lResultados[[sCenario]], {
+    cat("  r direta ...........:", fMediaPond(vR), "%\n")
+    cat("  t insumos nacionais :", fMediaPond(vTd), "%\n")
+    cat("  t insumos importados:", fMediaPond(vTm), "%\n")
+    cat("  t FBCF nacional ....:", fMediaPond(vTdc), "%\n")
+    cat("  t FBCF importada ...:", fMediaPond(vTmc), "%\n")
+    cat("  Total ..............:", fMediaPond(vTotal), "%\n")
+  })
+}
+
+#################################################################################
+# 5. Tabelas finais no formato do Apêndice H
+#################################################################################
+fDadosFinal <- function(sCenario) {
+  with(lResultados[[sCenario]],
+       list(vPeD = lCenarios[[sCenario]]$vPeDDireta, vX = vX, vVA = vVA,
+            vOcupacoes = vOcupacoes, vR = vR, vTd = vTd, vTm = vTm,
+            vTdc = vTdc, vTmc = vTmc))
+}
+lNomesMorceiro <- dReferencia$setor_morceiro
+dIndicadoresFinal_C1 <- fTabelaApendiceHCompleta(fDadosFinal("C1"), lNomesMorceiro, lCodigoSetores)
+dIndicadoresFinal_C2 <- fTabelaApendiceHCompleta(fDadosFinal("C2"), lNomesMorceiro, lCodigoSetores)
+
+# Conferência: o total da tabela é a soma dos cinco componentes
+for (dTab in list(dIndicadoresFinal_C1, dIndicadoresFinal_C2)) {
+  stopifnot(max(abs(dTab$Total - (dTab$Direta + dTab$Indireta_insumos_nac +
+                                    dTab$Indireta_insumos_imp + dTab$Indireta_FBCF_nac +
+                                    dTab$Indireta_FBCF_imp))) < 1e-9)
+}
+
+#################################################################################
+# 6. Comparação com 2013 (Morceiro, 2018, Apêndice H - com realocação)
+#################################################################################
+lR2 <- lResultados$C2
+dComparacaoFinal <- data.frame(
+  Codigo = lCodigoSetores, Setor = dReferencia$setor_morceiro,
+  FBCFnac_2013 = dReferencia$H_ind_fbcf_nac, FBCFnac_2018_C2 = 100 * lR2$vTdc,
+  FBCFimp_2013 = dReferencia$H_ind_fbcf_imp, FBCFimp_2018 = 100 * lR2$vTmc,
+  Total_2013 = dReferencia$H_total, Total_2018_C2 = 100 * lR2$vTotal,
+  Mult_2013 = dReferencia$H_multiplicador, Mult_2018_C2 = lR2$vMultiplicador
+)
+fCor <- function(a, b, m) cor(a, b, method = m, use = "complete.obs")
+dCorrelacoesFinal <- data.frame(
+  Componente = c("Indireta FBCF nacional", "Indireta FBCF importada", "Total", "Multiplicador"),
+  Pearson = c(fCor(dComparacaoFinal$FBCFnac_2013, dComparacaoFinal$FBCFnac_2018_C2, "pearson"),
+              fCor(dComparacaoFinal$FBCFimp_2013, dComparacaoFinal$FBCFimp_2018, "pearson"),
+              fCor(dComparacaoFinal$Total_2013, dComparacaoFinal$Total_2018_C2, "pearson"),
+              fCor(dComparacaoFinal$Mult_2013, dComparacaoFinal$Mult_2018_C2, "pearson")),
+  Spearman = c(fCor(dComparacaoFinal$FBCFnac_2013, dComparacaoFinal$FBCFnac_2018_C2, "spearman"),
+               fCor(dComparacaoFinal$FBCFimp_2013, dComparacaoFinal$FBCFimp_2018, "spearman"),
+               fCor(dComparacaoFinal$Total_2013, dComparacaoFinal$Total_2018_C2, "spearman"),
+               fCor(dComparacaoFinal$Mult_2013, dComparacaoFinal$Mult_2018_C2, "spearman"))
+)
+cat("\nCorrelação 2013 x 2018 (cenário 2, 68 setores):\n")
+print(dCorrelacoesFinal, digits = 3)
+
+#################################################################################
+# 6A. Índice de esforço tecnológico e classificação dos setores (equação 15)
+#################################################################################
+# Critério próprio deste trabalho (não é o de Morceiro, 2018, que classifica só
+# a indústria de transformação pela taxonomia da OCDE):
+#   IE_j = r_j / r_medio,   r_medio = soma(P&D) / soma(X)
+#   Intensivo em tecnologia: IE_j > 1
+# A coluna "Taxonomia OCDE" mostra, para comparação, o grupo de Morceiro (2018)
+# baseado em Galindo-Rueda e Verger (2016).
+fGrupoSetor <- function(lEstrutura) {
+  dMapa <- data.frame()
+  for (lGrupo in lEstrutura) {
+    if (!is.null(lGrupo$subgrupos)) {
+      for (lSub in lGrupo$subgrupos) {
+        dMapa <- rbind(dMapa, data.frame(Codigo = lSub$codigos, Grupo = lGrupo$nome,
+                                         Subgrupo = lSub$nome))
+      }
+    } else {
+      dMapa <- rbind(dMapa, data.frame(Codigo = lGrupo$codigos, Grupo = lGrupo$nome,
+                                       Subgrupo = lGrupo$nome))
+    }
+  }
+  return(dMapa)
+}
+dMapaGrupos <- fGrupoSetor(fEstruturaApendiceH())
+
+fTabelaEsforco <- function(sCenario) {
+  lRes <- lResultados[[sCenario]]
+  vPeD <- lCenarios[[sCenario]]$vPeDDireta
+  nMedia <- sum(vPeD) / sum(vX)                       # intensidade média da economia
+  vIE <- lRes$vR / nMedia
+  dMapa <- dMapaGrupos[match(lCodigoSetores, dMapaGrupos$Codigo), ]
+  vOCDE <- ifelse(dMapa$Subgrupo == "Indústria de maior intensidade tecnológica",
+                  "Alta e média-alta",
+                  ifelse(dMapa$Subgrupo == "Indústria de menor intensidade tecnológica",
+                         "Média e média-baixa", "Não classificado"))
+  dTab <- data.frame(
+    Codigo = lCodigoSetores,
+    Setor = dReferencia$setor_morceiro,
+    Grupo = dMapa$Subgrupo,
+    Taxonomia_OCDE = vOCDE,
+    PeD_milhoes = vPeD,
+    Intensidade_direta_pct = 100 * lRes$vR,
+    Esforco_tecnologico = vIE,
+    Intensivo = ifelse(vIE > 1, "Sim", "Não"),
+    Intensidade_total_pct = 100 * lRes$vTotal,
+    Multiplicador = lRes$vMultiplicador
+  )
+  dTab <- dTab[order(-dTab$Esforco_tecnologico, dTab$Codigo), ]
+  dTab <- cbind(Posicao = seq_len(nrow(dTab)), dTab)
+  rownames(dTab) <- NULL
+  attr(dTab, "media") <- 100 * nMedia
+  return(dTab)
+}
+dEsforco_C1 <- fTabelaEsforco("C1")
+dEsforco_C2 <- fTabelaEsforco("C2")
+
+cat("\nCenário 2 - intensidade média da economia:", round(attr(dEsforco_C2, "media"), 3), "%\n")
+cat("Setores intensivos em tecnologia (esforço > 1):", sum(dEsforco_C2$Intensivo == "Sim"), "\n")
+cat("Setores de alta e média-alta (OCDE) com esforço > 1:",
+    sum(dEsforco_C2$Taxonomia_OCDE == "Alta e média-alta" & dEsforco_C2$Intensivo == "Sim"),
+    "de", sum(dEsforco_C2$Taxonomia_OCDE == "Alta e média-alta"), "\n")
+
+# Escreve a tabela do esforço tecnológico em uma aba formatada
+fEscreverEsforco <- function(wb, sAba, sTitulo, dTab, vNotas) {
+  addWorksheet(wb, sAba, gridLines = FALSE)
+  sFonte <- "Times New Roman"
+  writeData(wb, sAba, sTitulo, startRow = 1, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 11, textDecoration = "bold"),
+           rows = 1, cols = 1)
+  vCab <- c("Posição", "Código", "Setor de atividade (SCN Ref. 2010)", "Grupo (Apêndice H)",
+            "Taxonomia OCDE (Morceiro, 2018)", "P&D direta (R$ milhões)",
+            "Intensidade em P&D direta (%)", "Índice de esforço tecnológico (IE)",
+            "Intensivo em tecnologia (IE > 1)", "Intensidade em P&D total (%)",
+            "Multiplicador tecnológico")
+  writeData(wb, sAba, t(vCab), startRow = 3, startCol = 1, colNames = FALSE)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, textDecoration = "bold",
+                                 halign = "center", valign = "center", wrapText = TRUE,
+                                 fgFill = "#D9D9D9", border = "TopBottomLeftRight"),
+           rows = 3, cols = seq_along(vCab), gridExpand = TRUE)
+  dSaida <- dTab
+  attr(dSaida, "media") <- NULL
+  writeData(wb, sAba, dSaida, startRow = 4, startCol = 1, colNames = FALSE, keepNA = FALSE)
+  vFormatos <- c("0", "@", "@", "@", "@", "#,##0.0", "0.00", "0.00", "@", "0.00", "0.0")
+  for (i in seq_len(nrow(dTab))) {
+    sFundo <- if (dTab$Intensivo[i] == "Sim") "#E2EFDA" else NULL
+    for (j in seq_along(vFormatos)) {
+      addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = vFormatos[j],
+                                     fgFill = sFundo, border = "TopBottomLeftRight",
+                                     borderColour = "#BFBFBF",
+                                     halign = if (j %in% c(3, 4, 5)) "left" else "center"),
+               rows = 3 + i, cols = j)
+    }
+  }
+  nFim <- 3 + nrow(dTab)
+  writeData(wb, sAba, vNotas, startRow = nFim + 2, startCol = 1)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 8),
+           rows = (nFim + 2):(nFim + 1 + length(vNotas)), cols = 1)
+  setColWidths(wb, sAba, cols = seq_along(vCab), widths = c(7, 7, 48, 34, 18, 11, 11, 11, 11, 11, 11))
+  setRowHeights(wb, sAba, rows = 3, heights = 45)
+  freezePane(wb, sAba, firstActiveRow = 4)
+}
+
+#################################################################################
+# 7. Exportação (opcional)
+#################################################################################
+vNotas <- c(
+  "Fonte: elaboração própria a partir de IBGE (TRU 2018), NEREUS/USP (MIP 2018), IPEA (MAI 2018) e Morceiro (2018, Tabela K).",
+  "Nota: valores correntes de 2018. PIB corresponde ao valor adicionado bruto a preços básicos. P&D / Pessoal ocupado em R$ por pessoa ocupada.",
+  "Nota: nos grupos e no total, P&D, produção, PIB e pessoal ocupado são somas dos setores; os componentes da P&D sobre a produção são médias ponderadas pela produção.",
+  "Nota: na MAI, a linha Famílias foi somada à Construção como setor fornecedor, e a coluna Famílias (investimento das famílias) foi excluída."
+)
+sNotaC2 <- "Nota: P&D dos institutos públicos de pesquisa e do Cenpes/Petrobras realocada aos setores de finalidade da pesquisa com as proporções de 2013 de Morceiro (2018, Tabelas 4.1 e 4.2)."
+
+# Acrescenta, à direita do multiplicador, a coluna do índice de esforço
+# tecnológico (IE) em uma aba já escrita no formato do Apêndice H.
+#   Setores e grupos: IE = intensidade direta / intensidade direta da economia
+#   (a intensidade direta dos grupos já é a P&D do grupo / produção do grupo)
+fAdicionarColunaEsforco <- function(wb, sAba, dTabela, nColuna = 15, nInicio = 6) {
+  sFonte <- "Times New Roman"
+  nMedia <- dTabela$Direta[dTabela$Setor == "TOTAL"]
+  vIE <- dTabela$Direta / nMedia
+  writeData(wb, sAba, "Esforço Tecnológico (IE)", startRow = 3, startCol = nColuna)
+  mergeCells(wb, sAba, cols = nColuna, rows = 3:5)
+  addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, halign = "center",
+                                 valign = "center", wrapText = TRUE,
+                                 border = "TopBottomLeftRight", borderStyle = "thin"),
+           rows = 3:5, cols = nColuna, gridExpand = TRUE)
+  writeData(wb, sAba, vIE, startRow = nInicio, startCol = nColuna, colNames = FALSE)
+  for (i in seq_len(nrow(dTabela))) {
+    bGrupo <- dTabela$Grupo[i]
+    addStyle(wb, sAba, createStyle(fontName = sFonte, fontSize = 9, numFmt = "0.00",
+                                   halign = "right",
+                                   textDecoration = if (bGrupo) "bold" else NULL,
+                                   border = if (bGrupo) "top" else NULL, borderStyle = "thin"),
+             rows = nInicio + i - 1, cols = nColuna)
+  }
+  addStyle(wb, sAba, createStyle(border = "bottom", borderStyle = "thin"),
+           rows = nInicio + nrow(dTabela) - 1, cols = nColuna, stack = TRUE)
+  setColWidths(wb, sAba, cols = nColuna, widths = 10)
+  return(vIE)
+}
+
+sNotaIE <- paste0("Nota: Esforço Tecnológico (IE) = intensidade em P&D direta do setor / intensidade em P&D direta da economia (",
+                  formatC(attr(dEsforco_C2, "media"), format = "f", digits = 2, decimal.mark = ","),
+                  "% da produção). Setores com IE > 1 são considerados intensivos em tecnologia (critério próprio deste trabalho).")
+
+if (bExportarResultados) {
+  dir.create("Outputs", showWarnings = FALSE)
+  wb <- createWorkbook()
+  # Tabela principal: realocação da P&D pública (cenário 2, adotado no trabalho)
+  sAbaPrincipal <- "Indicadores PeD 2018"
+  fEscreverApendiceHCompleto(wb, sAbaPrincipal,
+                             "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - REALOCAÇÃO DA P&D PÚBLICA (MORCEIRO, 2018)",
+                             dIndicadoresFinal_C2, c(vNotas, sNotaC2, sNotaIE), bProvisorio = FALSE)
+  dIndicadoresFinal_C2$Esforco_tecnologico <- fAdicionarColunaEsforco(wb, sAbaPrincipal, dIndicadoresFinal_C2)
+
+  if (bExportarApoio) {
+    fEscreverApendiceHCompleto(wb, "Sem realocacao (C1)",
+                               "INDICADORES DE P&D PARA 68 SETORES DE ATIVIDADE (2018) - SEM REALOCAÇÃO DA P&D PÚBLICA",
+                               dIndicadoresFinal_C1, vNotas, bProvisorio = FALSE)
+    fAdicionarColunaEsforco(wb, "Sem realocacao (C1)", dIndicadoresFinal_C1)
+    fEscreverEsforco(wb, "Ranking esforco",
+                     "ÍNDICE DE ESFORÇO TECNOLÓGICO DOS 68 SETORES DE ATIVIDADE (2018) - REALOCAÇÃO DA P&D PÚBLICA",
+                     dEsforco_C2,
+                     c("Fonte: elaboração própria a partir de IBGE (TRU 2018), NEREUS/USP (MIP 2018), IPEA (MAI 2018) e Morceiro (2018).",
+                       sNotaIE,
+                       "Nota: a coluna Taxonomia OCDE reproduz, para comparação, a classificação da indústria de transformação usada por Morceiro (2018), baseada em Galindo-Rueda e Verger (2016).",
+                       "Nota: multiplicador não definido para setores sem P&D direta.",
+                       sNotaC2))
+    addWorksheet(wb, "Comparacao 2013 x 2018")
+    writeData(wb, "Comparacao 2013 x 2018", dComparacaoFinal)
+    addWorksheet(wb, "Correlacoes")
+    writeData(wb, "Correlacoes", dCorrelacoesFinal)
+    addWorksheet(wb, "Conferencias MAI")
+    writeData(wb, "Conferencias MAI", dConferenciasMAI)
+    addWorksheet(wb, "MAI x MIP por setor")
+    writeData(wb, "MAI x MIP por setor", dComparacaoFBCF)
+  }
+  saveWorkbook(wb, file.path("Outputs", "04_Indicadores_PeD_2018.xlsx"), overwrite = TRUE)
+}
+```
+

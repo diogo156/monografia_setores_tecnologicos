@@ -1,0 +1,17 @@
+# Arquivos do R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+.Ruserdata
+
+# Saídas geradas ao renderizar os .Rmd
+*.html
+*_files/
+*_cache/
+Outputs/
+
+# Bases de dados (obtidas nas fontes oficiais; ver README)
+*.xlsx
+*.xls
+*.csv
